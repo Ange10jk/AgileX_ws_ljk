@@ -1,0 +1,5 @@
+# Official scene: https://robodojo-benchmark.com/doc/real-tasks/stand-up-bottles/
+extends: ../collect_dual.yaml
+observation:
+  task: Stand the bottle upright.
+  description: There is a bottle lying on the table. The robot needs to pick it up and place it upright on the table.

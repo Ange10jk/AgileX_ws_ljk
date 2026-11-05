@@ -1,0 +1,5 @@
+# Official scene: https://robodojo-benchmark.com/doc/real-tasks/stack-and-cover-blocks/
+extends: ../collect_dual.yaml
+observation:
+  task: Stack the blocks on the table, then cover them with the cup.
+  description: There are several blocks and a cup on the table. The robot needs to stack the blocks into a pile and then place the cup over them to cover the stacked blocks.

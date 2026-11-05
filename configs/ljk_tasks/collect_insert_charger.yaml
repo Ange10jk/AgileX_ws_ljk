@@ -1,0 +1,5 @@
+# Official scene: https://robodojo-benchmark.com/doc/real-tasks/insert-charger/
+extends: ../collect_dual.yaml
+observation:
+  task: Insert the charger plug into the power strip, then connect the charging cable to the plug.
+  description: There is a charger plug, a charging cable, and a power strip on the table. The robot needs to insert the charger plug into the power strip and then connect the charging cable to the plug.

@@ -1,0 +1,5 @@
+# Official scene: https://robodojo-benchmark.com/doc/real-tasks/stack-bowls/
+extends: ../collect_dual.yaml
+observation:
+  task: Stack the bowls on the table.
+  description: There are several bowls on the table. The robot needs to pick them up one by one and stack them neatly.

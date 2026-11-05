@@ -1,0 +1,5 @@
+# Official scene: https://robodojo-benchmark.com/doc/real-tasks/fill-pen-holder/
+extends: ../collect_dual.yaml
+observation:
+  task: Pick up the pen holder and place all the pens into it.
+  description: There is a pen holder and several pens on the table. The robot needs to pick up the pen holder and place all the pens into it one by one.
