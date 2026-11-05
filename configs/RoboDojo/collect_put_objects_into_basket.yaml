@@ -1,5 +1,5 @@
 # Official scene: https://robodojo-benchmark.com/doc/real-tasks/put-objects-into-basket/
-extends: ../collect_dual.yaml
+extends: ../collect_dual_RoboDojo.yaml
 observation:
   task: Place all the objects on the table into the basket.
   description: There are multiple objects on the table and a basket nearby. The robot needs to pick up all the objects one by one and place them into the basket.
