@@ -5,9 +5,12 @@ robot:
   arms: [left, right]
   control_hz: 30
 
+observation:
+  fps: 30
+
 workflow:
   auto_start: true
-  policy_hz: 15
+  policy_hz: 30
   max_episode_sec: null
 
 record:
