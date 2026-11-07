@@ -1,5 +1,6 @@
 """Control loop: SDK motion and intervention remain independent of inference."""
 
+import math
 import queue
 import select
 import signal
@@ -71,6 +72,7 @@ class Session:
         self._closing = threading.Event()
         self._stop_thread = None
         self._stop_error = None
+        self._camera_recording = False
 
     def event(self, event):
         self.recording.write_event(event)
@@ -94,6 +96,12 @@ class Session:
 
     def start(self):
         self.recording.start()
+        if (self.cfg["record"].get("backend") in ("ros", "ros_publish")
+                and hasattr(self.cameras, "record_to")):
+            self.cameras.record_to(
+                self.recording.publish_images,
+                capacity=int(self.cfg["record"].get("camera_queue_size", 32)))
+            self._camera_recording = True
         self.cameras.start()
         if self.workflow.uses_policy:
             if self.learning and self.recording.directory is not None:
@@ -425,16 +433,24 @@ class Session:
             started = time.monotonic()
             next_policy = started
             next_control = started
+            policy_hz = self.cfg["workflow"]["policy_hz"]
+            control_hz = self.cfg["robot"]["control_hz"]
+            control_period = 1.0 / control_hz
+            collect_on_control_tick = (
+                self.workflow.name == "collect" and policy_hz == control_hz
+            )
             auto = self.cfg["workflow"].get("auto_start", False)
             episode_limit = self.cfg["workflow"]["max_episode_sec"]
             while True:
                 now = time.monotonic()
+                policy_due = collect_on_control_tick or now >= next_policy
                 self.recording.check_health()
                 self.cameras.check_health()
                 self._poll()
                 snapshot, frames = self.robot.snapshot(), self.cameras.snapshot()
                 self.recording.publish_state(snapshot)
-                self.recording.publish_images(frames)
+                if not self._camera_recording:
+                    self.recording.publish_images(frames)
                 self.controller.tick(snapshot)
                 if auto:
                     self.command(self.workflow.initial_command, snapshot, frames)
@@ -461,7 +477,7 @@ class Session:
                         or (
                             self.pending is not None
                             and self.total_steps + 1 >= max_steps
-                            and now >= next_policy
+                            and policy_due
                         )
                     )
                 ) or (max_seconds is not None and now - started >= max_seconds)
@@ -480,13 +496,22 @@ class Session:
                         )
                 if self.quit and not self.learning_pending:
                     break
-                if now >= next_policy and self.episode_active:
+                if policy_due and self.episode_active:
                     self._policy_tick(snapshot, frames)
-                    next_policy = now + 1.0 / self.cfg["workflow"]["policy_hz"]
-                next_control += 1.0 / self.cfg["robot"]["control_hz"]
-                time.sleep(max(0.0, min(next_control - time.monotonic(), 0.05)))
-                if next_control < time.monotonic() - 0.1:
-                    next_control = time.monotonic()
+                    if not collect_on_control_tick:
+                        next_policy = now + 1.0 / policy_hz
+                next_control += control_period
+                if collect_on_control_tick:
+                    remaining = next_control - time.monotonic()
+                    if remaining < 0:
+                        # Missed slots have no historical action to record.
+                        skipped = math.ceil(-remaining / control_period)
+                        next_control += skipped * control_period
+                    time.sleep(max(0.0, next_control - time.monotonic()))
+                else:
+                    time.sleep(max(0.0, min(next_control - time.monotonic(), 0.05)))
+                    if next_control < time.monotonic() - 0.1:
+                        next_control = time.monotonic()
             self._log("session_end", steps=self.total_steps)
         except BaseException as exc:
             error = "%s: %s" % (type(exc).__name__, exc)

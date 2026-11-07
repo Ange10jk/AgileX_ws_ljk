@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 from pathlib import Path
@@ -5,6 +6,7 @@ import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -12,10 +14,13 @@ from unittest import mock
 
 import numpy as np
 
-from piper_control.ipc import _decode, read_message, write_message
+from piper_control.config import load_config
+from piper_control.hardware.cameras import CameraRig
+from piper_control.ipc import _decode, _owned, read_message, write_message
 from piper_control.recording.client import CollectionError, CollectorClient
 from piper_control.recording.session import RecordingSession
 from piper_control.recording.ros_worker import serve
+from piper_control.workflows.session import Session
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,8 +31,13 @@ sys.path.insert(0, ROOT_PATH)
 from piper_control.ipc import _encode
 from piper_control.recording.ros_worker import serve
 class Bridge:
-    def __init__(self, cfg): self.path=None
-    def start(self): pass
+    def __init__(self, cfg):
+        self.options=cfg['record']
+        self.path=None
+    def start(self):
+        if self.options['backend']=='ros_publish':
+            self.path=Path(self.options['output_dir'])
+            self.log('ready', {})
     def start_bag(self, directory):
         self.path=Path(directory)
         self.log('ready', {})
@@ -131,6 +141,76 @@ class CollectionProcessTests(unittest.TestCase):
             with self.assertRaisesRegex(CollectionError, "queue is full"):
                 client.publish_event({"value": 2})
             self.assertEqual(client.queue.qsize(), 1)
+
+    def test_image_copy_does_not_block_control_and_sequences_follow_fifo(self):
+        with tempfile.TemporaryDirectory() as root:
+            client = CollectorClient(self.config(root), root)
+            client.process = types.SimpleNamespace(poll=lambda: None)
+            copying, release = threading.Event(), threading.Event()
+            pixels = np.full((2, 3, 3), 17, dtype=np.uint8)
+            frames = {"top": {"rgb": pixels, "stamp": 1.0}}
+
+            def copy_payload(payload):
+                if "top" in payload:
+                    copying.set()
+                    if not release.wait(5):
+                        raise AssertionError("Control messages did not finish during image copy")
+                return _owned(payload)
+
+            with mock.patch("piper_control.recording.client._owned", side_effect=copy_payload):
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    image = executor.submit(client.publish_images, frames)
+                    try:
+                        self.assertTrue(copying.wait(5))
+                        client.publish_state({"state": np.zeros(7)})
+                        client.publish_action(np.zeros(7), "HUMAN")
+                        client.publish_event({"type": "test"})
+                        self.assertFalse(image.done())
+                    finally:
+                        release.set()
+                    image.result()
+
+            messages = [client.queue.get_nowait() for _ in range(4)]
+            self.assertEqual([m["kind"] for m in messages], ["state", "action", "event", "images"])
+            self.assertEqual([m["seq"] for m in messages], [1, 2, 3, 4])
+
+    def test_publish_session_drains_captured_frames_before_collector_closes(self):
+        class TestRig(CameraRig):
+            def _capture(self, name, config, rs, np):
+                for stamp in (1.0, 2.0):
+                    self._store_frame(name, {"stamp": stamp, "rgb": np.zeros((2, 3, 3), dtype=np.uint8)})
+                self._stop.wait()
+                # A frame already being captured can finish after stop is signalled.
+                self._store_frame(name, {"stamp": 3.0, "rgb": np.zeros((2, 3, 3), dtype=np.uint8)})
+                self.capture_finished.set()
+
+        with tempfile.TemporaryDirectory() as root:
+            cfg = load_config(ROOT / "configs" / "collect_dual_RoboDojo.yaml", {
+                "observation": {"camera_map": {"observation.images.cam_h": "cam_h"}},
+                "record": self.config(root, "ros_publish")["record"],
+            })
+            rig = TestRig(cfg["observation"])
+            rig.capture_finished = threading.Event()
+            recording = RecordingSession(cfg, collector_factory=self.factory(root))
+            publish_images = recording.publish_images
+
+            def publish_after_capture(frames):
+                if not rig.capture_finished.wait(5):
+                    raise AssertionError("Capture did not stop before publisher drain")
+                publish_images(frames)
+
+            recording.publish_images = publish_after_capture
+            session = Session(cfg, mock=True, cameras=rig, recording=recording)
+            with mock.patch.dict(sys.modules, {"pyrealsense2": types.ModuleType("pyrealsense2")}):
+                result = session.run(max_steps=1, max_seconds=1.0, interactive=False)
+            self.assertEqual(result["steps"], 1)
+            self.assertFalse(rig._publisher.is_alive())
+            self.assertEqual(recording.collector.process.returncode, 0)
+            audit = [json.loads(line) for line in
+                     (Path(root) / "collector.audit.jsonl").read_text().splitlines()]
+            stamps = [row["payload"]["cam_h"]["stamp"] for row in audit if row["kind"] == "images"]
+            self.assertEqual(stamps, [1.0, 2.0, 3.0])
+            self.assertEqual(audit[-1]["kind"], "closed")
 
     def test_worker_rejects_motion_messages_and_closes_collector(self):
         incoming, outgoing = io.BytesIO(), io.BytesIO()

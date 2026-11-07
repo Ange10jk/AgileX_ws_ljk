@@ -4,10 +4,12 @@ import collections
 import json
 from pathlib import Path
 import signal
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -103,6 +105,21 @@ class _Recording(RecordingSession):
         return super().close(error)
 
 
+class _ControlClock:
+    def __init__(self, sleep_lateness=()):
+        self.now = 0.0
+        self.sleep_lateness = iter(sleep_lateness)
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds + next(self.sleep_lateness, 0.0)
+
+
 class WorkflowTests(unittest.TestCase):
     def config(self, directory):
         return load_config(
@@ -110,6 +127,7 @@ class WorkflowTests(unittest.TestCase):
             {
                 "record": {"output_dir": directory, "min_free_gb": 0},
                 "observation": {"width": 8, "height": 6},
+                "policy": {"python": sys.executable},
             },
         )
 
@@ -123,6 +141,52 @@ class WorkflowTests(unittest.TestCase):
 
     def manifest(self, session):
         return json.loads((session.recording.directory / "manifest.json").read_text())
+
+    def run_clocked_collection(self, clock, max_steps, *, policy_hz=30,
+                               schedule=(), first_action_cost=0.0):
+        cfg = load_config(CONFIG.parent / "collect_dual_RoboDojo.yaml", {
+            "workflow": {"policy_hz": policy_hz},
+            "observation": {"width": 8, "height": 6},
+        })
+        recording = mock.Mock(spec=RecordingSession, directory=None)
+        samples = []
+
+        def sample(_action, _source, metadata):
+            samples.append((metadata["timestamp"], metadata["step_id"]))
+            if len(samples) == 1:
+                clock.now += first_action_cost
+
+        recording.publish_action.side_effect = sample
+        session = Session(cfg, mock=True, recording=recording, command_schedule=schedule)
+        with mock.patch("piper_control.workflows.session.time", clock):
+            result = session.run(max_steps=max_steps, max_seconds=1.0, interactive=False)
+        self.assertEqual(result["steps"], max_steps)
+        self.assertEqual([step_id for _, step_id in samples], list(range(max_steps)))
+        self.assertEqual(recording.write_step.call_count, max_steps)
+        self.assertTrue(recording.write_step.call_args.args[0]["truncated"])
+        return [stamp for stamp, _ in samples]
+
+    def test_equal_rate_collect_samples_each_control_tick_despite_sleep_jitter(self):
+        clock = _ControlClock(sleep_lateness=[.003, .001, .004, .002])
+        samples = self.run_clocked_collection(clock, 5)
+        np.testing.assert_allclose(
+            samples, [0, 1 / 30 + .003, 2 / 30 + .001, 3 / 30 + .004, 4 / 30 + .002]
+        )
+
+    def test_equal_rate_collect_skips_expired_slots_after_overrun(self):
+        samples = self.run_clocked_collection(_ControlClock(), 3, first_action_cost=.105)
+        np.testing.assert_allclose(samples, [0, 4 / 30, 5 / 30])
+
+    def test_equal_rate_collect_resumes_without_backfill_and_stops_at_limit(self):
+        samples = self.run_clocked_collection(
+            _ControlClock(), 4, schedule=[(.05, "hold"), (.12, "h")]
+        )
+        np.testing.assert_allclose(samples, [0, 1 / 30, 4 / 30, 5 / 30])
+
+    def test_unequal_rate_collect_keeps_legacy_policy_deadline(self):
+        clock = _ControlClock(sleep_lateness=[.003, .004, .003, .001, .002])
+        samples = self.run_clocked_collection(clock, 3, policy_hz=15)
+        np.testing.assert_allclose(samples, [0, 2 / 30 + .004, 5 / 30 + .002])
 
     def test_real_worker_keeps_step_cadence_and_stops_at_exact_limit(self):
         with tempfile.TemporaryDirectory() as directory:

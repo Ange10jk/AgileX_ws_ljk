@@ -48,7 +48,11 @@ from piper_control.config import load_config
 from piper_control.workflows.session import Session
 for mode in ('deploy', 'teleop'):
     with tempfile.TemporaryDirectory() as output:
-        cfg = load_config('configs/mock.yaml', {'workflow': {'mode': mode}, 'record': {'backend': 'none', 'output_dir': output}})
+        cfg = load_config('configs/mock.yaml', {
+            'workflow': {'mode': mode},
+            'record': {'backend': 'none', 'output_dir': output},
+            'policy': {'python': sys.executable},
+        })
         session = Session(cfg, mock=True)
         result = session.run(max_steps=3, max_seconds=3., interactive=False)
         assert result['steps'] == 3 and result['directory'] is None

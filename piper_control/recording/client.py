@@ -28,6 +28,7 @@ class CollectorClient:
         self.replies = queue.Queue(maxsize=2)
         self.timeout = float(self.options.get("command_timeout_sec", 5.))
         self.shutdown_timeout = float(self.options.get("shutdown_timeout_sec", 20.))
+        self._enqueue_lock = threading.Lock()
         self._sequence = 0
         self._error = None
         self._closing = False
@@ -36,8 +37,7 @@ class CollectorClient:
         self._writer_thread = None
         self._reader_thread = None
         self._image_stamps = {}
-        self._active_since = None
-        self._active_kind = None
+        self._active_message = None
 
     def _argv(self):
         python = self.options.get("python") or sys.executable
@@ -113,15 +113,13 @@ class CollectorClient:
         try:
             while True:
                 message = self.queue.get()
-                self._active_kind = message["kind"]
-                self._active_since = time.monotonic()
+                self._active_message = (message["kind"], time.monotonic())
                 write_message(self.process.stdin, message)
                 closing = message["kind"] == "close"
                 reply = self._reply(self.shutdown_timeout if closing else self.timeout)
                 if reply.get("seq") != message["seq"] or reply.get("kind") != ("closed" if closing else "ack"):
                     raise CollectionError("Collection acknowledgement does not match submitted input")
-                self._active_since = None
-                self._active_kind = None
+                self._active_message = None
                 if closing:
                     self._close_ack.set()
                     return
@@ -129,17 +127,21 @@ class CollectorClient:
             self._error = exc
 
     def _enqueue(self, kind, payload):
-        if self.process is None or self._closed or self._closing:
-            raise CollectionError("Collection process is not accepting input")
-        self.check_health()
-        self._sequence += 1
-        message = {"kind": kind, "seq": self._sequence, "payload": _owned(payload),
-                   "captured_epoch": time.time(), "captured_monotonic": time.monotonic()}
-        try:
-            self.queue.put_nowait(message)
-        except queue.Full as exc:
-            self._error = CollectionError("Collection queue is full; recording cannot silently drop samples")
-            raise self._error from exc
+        # Copy before taking the lock so large frames do not block control
+        # messages. Assign sequence numbers in the order messages enter the FIFO.
+        owned_payload = _owned(payload)
+        with self._enqueue_lock:
+            if self.process is None or self._closed or self._closing:
+                raise CollectionError("Collection process is not accepting input")
+            self.check_health()
+            self._sequence += 1
+            message = {"kind": kind, "seq": self._sequence, "payload": owned_payload,
+                       "captured_epoch": time.time(), "captured_monotonic": time.monotonic()}
+            try:
+                self.queue.put_nowait(message)
+            except queue.Full as exc:
+                self._error = CollectionError("Collection queue is full; recording cannot silently drop samples")
+                raise self._error from exc
 
     def publish_state(self, snapshot):
         self._enqueue("state", snapshot)
@@ -168,9 +170,11 @@ class CollectorClient:
             raise CollectionError(str(self._error)) from self._error
         if self._closed:
             return
-        if self._active_since is not None:
-            limit = self.shutdown_timeout if self._active_kind == "close" else self.timeout
-            if time.monotonic() - self._active_since > limit:
+        active_message = self._active_message
+        if active_message is not None:
+            kind, started = active_message
+            limit = self.shutdown_timeout if kind == "close" else self.timeout
+            if time.monotonic() - started > limit:
                 raise CollectionError("Collection worker input stalled")
         if self.process is not None and self.process.poll() is not None and not self._close_ack.is_set():
             raise CollectionError("Collection worker exited unexpectedly")

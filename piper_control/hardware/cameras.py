@@ -6,6 +6,7 @@ relabelled with the computer's receive time.
 """
 
 import math
+import queue
 import threading
 import time
 
@@ -62,11 +63,49 @@ class CameraRig:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._started = False
+        self._record_queue = None
+        self._record_sink = None
+        self._publisher = None
+        self._publisher_stop = threading.Event()
+
+    def record_to(self, sink, capacity=32):
+        """Enable loss-intolerant capture delivery before starting cameras."""
+        if self._started:
+            raise RuntimeError("Configure camera recording before start")
+        if capacity < 1:
+            raise ValueError("Camera recording queue capacity must be positive")
+        self._record_sink = sink
+        self._record_queue = queue.Queue(maxsize=capacity)
+
+    def _store_frame(self, name, frame):
+        with self._lock:
+            self._frames[name] = frame
+        if self._record_queue is not None:
+            try:
+                self._record_queue.put_nowait((name, frame))
+            except queue.Full as exc:
+                raise RuntimeError("Camera recording queue full; cannot drop frames") from exc
+
+    def _publish_frames(self):
+        try:
+            while not self._publisher_stop.is_set() or not self._record_queue.empty():
+                try:
+                    name, frame = self._record_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                self._record_sink({name: frame})
+        except BaseException as exc:
+            with self._lock:
+                self._errors["recording"] = exc
 
     def start(self):
         if self._started:
             raise RuntimeError("Camera rig has already started")
         self._started = True
+        if self._record_sink is not None:
+            self._publisher = threading.Thread(
+                target=self._publish_frames, name="camera-recording", daemon=True)
+            self._publisher.start()
         if not self.selected:
             return self
         try:
@@ -201,8 +240,7 @@ class CameraRig:
                         - (now_epoch - aligned_depth_stamp),
                         aligned_depth_camera_info=_intrinsics(color, serial),
                     )
-                with self._lock:
-                    self._frames[name] = frame
+                self._store_frame(name, frame)
                 last_valid = time.monotonic()
         except BaseException as exc:
             with self._lock:
@@ -240,6 +278,11 @@ class CameraRig:
         still_running = [thread.name for thread in self._threads if thread.is_alive()]
         if still_running:
             raise RuntimeError("Camera shutdown timed out: " + ", ".join(still_running))
+        self._publisher_stop.set()
+        if self._publisher is not None:
+            self._publisher.join(timeout=20.0)
+            if self._publisher.is_alive():
+                raise RuntimeError("Camera recording shutdown timed out")
         # A capture thread can fail while stopping its pipeline after the last
         # successful health check. Propagate that error before the recording
         # session marks its manifest complete.
