@@ -18,6 +18,15 @@ from .artifacts import _atomic_json, json_value
 from .topics import missing_required_topics, topic_plan
 
 
+# Stream name, frame keys for data/stamp/calibration, optical frame, and enable switch.
+_CAMERA_STREAMS = (
+    ("color", "rgb", "stamp", "camera_info", "color", None),
+    ("depth", "depth", "depth_stamp", "depth_camera_info", "depth", "depth"),
+    ("aligned_depth_to_color", "aligned_depth", "aligned_depth_stamp",
+     "aligned_depth_camera_info", "color", "align_depth"),
+)
+
+
 class _BagWriter:
     def __init__(self, path, config, plan=None):
         import rosbag
@@ -128,6 +137,10 @@ class ROSBridge:
     def __init__(self, cfg):
         self.full_config = cfg
         self.config = dict(cfg.get("record", cfg))
+        self._worker_camera_publish = (
+            self.config.get("backend") == "ros_publish"
+            and self.config.get("camera_in_ros_worker", False)
+        )
         self.enabled = True
         namespace = self.config.get("topic_prefix", "/piper").strip("/")
         self.prefix = "/" + namespace if namespace else ""
@@ -168,8 +181,22 @@ class ROSBridge:
         self.messages = {"joint": JointState, "image": Image, "info": CameraInfo,
                          "string": String, "diagnostics": DiagnosticArray,
                          "status": DiagnosticStatus, "keyvalue": KeyValue}
+        if self._worker_camera_publish:
+            self._advertise_cameras()
         self._started = True
         return self
+
+    def _advertise_cameras(self):
+        from ..hardware.cameras import _selected
+
+        observation = self.full_config["observation"]
+        for name, camera in _selected(observation).items():
+            for stream, _, _, _, _, option in _CAMERA_STREAMS:
+                if option is not None and not camera.get(option, observation.get(option, False)):
+                    continue
+                topic = self.prefix + "/cameras/{}/{}".format(name, stream)
+                self._publisher(topic + "/image_raw", "image")
+                self._publisher(topic + "/camera_info", "info")
 
     def start_bag(self, directory):
         if not self.enabled:
@@ -196,18 +223,25 @@ class ROSBridge:
             raise RuntimeError("ROS bridge is not running")
         self.check_health()
         topic = self.prefix + "/" + suffix.strip("/")
-        direct_image = kind in ("image", "info") and self.config.get("camera_in_ros_worker", False)
+        publisher = self._publisher(topic, kind)
+        if self._bag is not None:
+            self._bag.put(topic, message, stamp)
+        publisher.publish(message)
+
+    def _publisher(self, topic, kind):
         if topic not in self._publishers:
             queue_size = 2 if kind == "image" else 10
-            if direct_image:
+            if kind in ("image", "info") and self.config.get("camera_in_ros_worker", False):
                 # Let CameraRig's bounded queue report backpressure. rospy's
                 # asynchronous queues discard old messages when full.
                 queue_size = None
             self._publishers[topic] = self.rospy.Publisher(
                 topic, self.messages[kind], queue_size=queue_size)
-        if self._bag is not None:
-            self._bag.put(topic, message, stamp)
-        self._publishers[topic].publish(message)
+        return self._publishers[topic]
+
+    def _camera_topic_needed(self, suffix):
+        return (not self._worker_camera_publish or self._bag is not None
+                or self._publishers[self.prefix + "/" + suffix].get_num_connections() > 0)
 
     def _time(self, stamp):
         stamp = float(stamp)
@@ -351,40 +385,27 @@ class ROSBridge:
         if not self.enabled:
             return
         for name, frame in frames.items():
-            streams = (
-                ("color", "rgb", "stamp", "camera_info", "color"),
-                ("depth", "depth", "depth_stamp", "depth_camera_info", "depth"),
-                (
-                    "aligned_depth_to_color",
-                    "aligned_depth",
-                    "aligned_depth_stamp",
-                    "aligned_depth_camera_info",
-                    "color",
-                ),
-            )
-            for kind, key, stamp_key, info_key, optical_frame in streams:
+            for kind, key, stamp_key, info_key, optical_frame, _ in _CAMERA_STREAMS:
                 if key not in frame:
                     continue
                 stamp = float(frame[stamp_key])
-                suffix = "cameras/{}/{}/image_raw".format(name, kind)
-                if stamp == self._last_stamps.get(suffix):
-                    continue
+                topic = "cameras/{}/{}".format(name, kind)
+                image_suffix = topic + "/image_raw"
+                info_suffix = topic + "/camera_info"
                 frame_id = name + "_" + optical_frame + "_optical_frame"
-                message = self._image(
-                    frame[key],
-                    stamp,
-                    frame_id,
-                    frame.get("depth_scale_m") if kind != "color" else None,
-                )
-                self._emit(suffix, "image", message, message.header.stamp)
-                info = self._camera_info(frame[info_key], stamp, frame_id)
-                self._emit(
-                    "cameras/{}/{}/camera_info".format(name, kind),
-                    "info",
-                    info,
-                    info.header.stamp,
-                )
-                self._last_stamps[suffix] = stamp
+                if stamp != self._last_stamps.get(image_suffix) and self._camera_topic_needed(image_suffix):
+                    message = self._image(
+                        frame[key],
+                        stamp,
+                        frame_id,
+                        frame.get("depth_scale_m") if kind != "color" else None,
+                    )
+                    self._emit(image_suffix, "image", message, message.header.stamp)
+                    self._last_stamps[image_suffix] = stamp
+                if stamp != self._last_stamps.get(info_suffix) and self._camera_topic_needed(info_suffix):
+                    info = self._camera_info(frame[info_key], stamp, frame_id)
+                    self._emit(info_suffix, "info", info, info.header.stamp)
+                    self._last_stamps[info_suffix] = stamp
 
     def publish_event(self, event):
         if not self.enabled:

@@ -13,7 +13,7 @@ robot:
 
 record:
   queue_size: 256
-  queue_diagnostics: true
+  queue_diagnostics: false
   # Opt in after checking the ROS Python environment (see docs/configuration.md).
   camera_in_ros_worker: true
   python: /home/robot/.venvs/piper-ros-realsense/bin/python

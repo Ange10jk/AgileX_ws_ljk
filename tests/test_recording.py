@@ -555,6 +555,73 @@ class BridgeTests(unittest.TestCase):
     HAS_ROS and HAS_NUMPY, "ROS Noetic messages and numpy are optional"
 )
 class NoeticSerializationTests(unittest.TestCase):
+    def test_worker_camera_publishers_are_advertised_and_gate_each_message(self):
+        import numpy as np
+        import rospy
+
+        publishers = {}
+
+        def publisher(topic, message_type, *, queue_size):
+            self.assertIsNone(queue_size)
+            sink = mock.Mock()
+            sink.get_num_connections.return_value = 0
+            publishers[topic] = sink
+            return sink
+
+        config = {
+            "record": {"backend": "ros_publish", "camera_in_ros_worker": True,
+                       "topic_prefix": "/test"},
+            "observation": {
+                "camera_map": {"rgb": "top", "duplicate": "top", "other": "side"},
+                "cameras": {"top": {"align_depth": True}, "side": {"depth": False}},
+                "depth": True,
+            },
+        }
+        with mock.patch.multiple(
+            rospy, get_master=mock.Mock(), get_param=mock.Mock(return_value=False),
+            is_shutdown=mock.Mock(return_value=False), Publisher=mock.Mock(side_effect=publisher),
+        ), mock.patch.object(rospy.core, "is_initialized", return_value=True):
+            bridge = ROSBridge(config).start()
+            self.addCleanup(bridge.close)
+            expected_streams = ("top/color", "top/depth", "top/aligned_depth_to_color", "side/color")
+            self.assertEqual(
+                bridge.topics,
+                sorted("/test/cameras/{}/{}".format(stream, leaf)
+                       for stream in expected_streams for leaf in ("image_raw", "camera_info")),
+            )
+            self.assertEqual(rospy.Publisher.call_count, 8)
+            frame = {
+                "rgb": np.zeros((2, 3, 3), dtype=np.uint8), "stamp": 100.,
+                "camera_info": {"width": 3, "height": 2, "fx": 3., "fy": 2., "ppx": 1.5, "ppy": 1.},
+            }
+            frames = {"top": frame}
+            image = publishers["/test/cameras/top/color/image_raw"]
+            info = publishers["/test/cameras/top/color/camera_info"]
+            with mock.patch.object(bridge, "_image", wraps=bridge._image) as make_image, mock.patch.object(
+                bridge, "_camera_info", wraps=bridge._camera_info,
+            ) as make_info:
+                bridge.publish_images(frames)
+                make_image.assert_not_called()
+                make_info.assert_not_called()
+
+                info.get_num_connections.return_value = 1
+                bridge.publish_images(frames)
+                make_image.assert_not_called()
+                self.assertEqual(info.publish.call_args.args[0].header.stamp.to_sec(), 100.)
+
+                info.get_num_connections.return_value = 0
+                image.get_num_connections.return_value = 1
+                bridge.publish_images(frames)
+                self.assertEqual(image.publish.call_args.args[0].header.stamp.to_sec(), 100.)
+                self.assertEqual(image.publish.call_args.args[0].encoding, "rgb8")
+
+                info.get_num_connections.return_value = 1
+                bridge.publish_images(frames)
+                make_image.assert_called_once()
+                make_info.assert_called_once()
+                image.publish.assert_called_once()
+                info.publish.assert_called_once()
+
     def test_real_bag_roundtrip_with_isolated_publishers_and_capture_stamps(self):
         import numpy as np
         import rosbag
