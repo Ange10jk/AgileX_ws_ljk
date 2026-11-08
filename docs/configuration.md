@@ -150,6 +150,7 @@ record:
   queue_size: 256
   queue_diagnostics: false
   camera_in_ros_worker: true
+  camera_queue_policy: strict
   python: ~/.venvs/piper-ros-realsense/bin/python
 ```
 
@@ -157,7 +158,13 @@ record:
 
 ROS 子进程会等每台所选相机成功发布第一组有效帧再报告就绪。相机等待上限为 `observation.startup_timeout_sec`（默认 15 秒），同一个超时也用于运行时检测持续收不到有效帧组。外层 `record.startup_timeout_sec`（默认 20 秒）还包含 ROS 初始化，须留出余量。子进程处理回合结束事件时，从相机缓存读取最近的 RGB 采集时间戳。逐帧分析应读 bag 中的原始图像头。
 
-子进程的 `record.camera_queue_size` 默认容纳 32 组帧，图像与 `camera_info` 使用同步 ROS 发布。相机故障和队列溢出会立即通过 IPC 上报，错误包含相机名，溢出时也会列出队列容量。排查性能时可设 `record.queue_diagnostics: true`，在终端 B 查看父进程队列与子进程的队列水位、溢出数、发布耗时及退出汇总。该选项默认关闭。发布计数反映本地发布调用，录包验收应以 bag 为准。正常退出时子进程先排空相机队列再注销 ROS publisher。发布线程退出超时时，子进程报错并直接退出，由系统关闭连接。
+子进程默认使用 `record.camera_queue_policy: strict`，按采集顺序发布帧组。`record.camera_queue_size` 默认容纳 32 组帧，溢出时会立即通过 IPC 上报相机名和队列容量。
+
+三台相机以 30 FPS 录制时，32 组帧的队列能否排空取决于 ROS 发布进程的实际吞吐。实测有多段录制正常完成，也曾在发布跟不上采集时出现队列满。更大的队列只在发布进程性能较低的工况下做过有限测试，缺少相同条件下的容量对照，暂时无法确定最合适的值。增大容量可以缓冲短时积压，持续吞吐不足时仍会填满。
+
+启用 `record.camera_in_ros_worker: true` 后，可设 `record.camera_queue_policy: latest`。每台相机只保留一组等待发布的帧，新帧组覆盖该相机尚未取出的帧组，等待顺序保持不变。每组的 RGB、原始深度、对齐深度和各自时间戳一起保留。退出汇总始终列出每台相机被覆盖的帧组数（`overwritten`）。录包中的图像可能出现时间缺口，恢复逐组排队可设回 `strict`。
+
+两种模式下，图像与 `camera_info` 都使用同步 ROS 发布，相机或发布故障会通过 IPC 上报。排查性能时可设 `record.queue_diagnostics: true`，在终端 B 查看父进程队列与子进程的队列水位、发布耗时及退出汇总。该选项默认关闭。发布计数反映本地发布调用，录包验收应以 bag 为准。正常退出时子进程先排空待发布的帧组再注销 ROS publisher。发布线程退出超时时，子进程报错并直接退出，由系统关闭连接。
 
 #### 检查实际 bag 的九路图像
 

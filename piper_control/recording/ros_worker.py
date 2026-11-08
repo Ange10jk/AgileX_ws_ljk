@@ -83,9 +83,12 @@ def serve(incoming, outgoing, bridge_factory=None, camera_factory=None, poll_inp
                             camera_factory = CameraRig
                         cameras = camera_factory(config["observation"])
                         report = options.get("queue_diagnostics", False)
-                        cameras.record_to(bridge.publish_images,
-                                          capacity=options.get("camera_queue_size", 32),
-                                          diagnostics=report)
+                        cameras.record_to(
+                            bridge.publish_images,
+                            capacity=options.get("camera_queue_size", 32),
+                            diagnostics=report,
+                            queue_policy=options.get("camera_queue_policy", "strict"),
+                        )
                         cameras.start(wait_for_publish=True)
                         check_health()
                 elif bridge is None or kind == "start":
@@ -138,8 +141,9 @@ def serve(incoming, outgoing, bridge_factory=None, camera_factory=None, poll_inp
         except Exception:
             if not failed:
                 traceback.print_exc(file=sys.stderr)
-        if report:
-            cameras.report_recording(final=True)
+        finally:
+            if cameras is not None:
+                cameras.report_recording(final=True)
 
 
 def main():

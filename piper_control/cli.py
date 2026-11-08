@@ -48,6 +48,7 @@ def main(argv=None):
         elif args.mock and config["record"]["backend"] == "ros_publish":
             config["record"]["backend"] = "none"
             config["record"]["camera_in_ros_worker"] = False
+            config["record"]["camera_queue_policy"] = "strict"
         if args.mock and config["workflow"]["mode"] == "online_rl":
             parser.error("Mock hardware smoke uses deploy/collect; learner tests use synthetic RLT fixtures")
         if args.command == "check-config":

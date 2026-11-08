@@ -5,6 +5,7 @@ cache with the actual capture timestamps. SDK hardware-clock timestamps are not
 relabelled with the computer's receive time.
 """
 
+from collections import OrderedDict
 import math
 import queue
 import sys
@@ -69,6 +70,9 @@ class CameraRig:
         self._stop = threading.Event()
         self._started = False
         self._record_queue = None
+        self._pending_cameras = None
+        self._record_ready = threading.Condition(self._lock)
+        self._record_diagnostics = False
         self._record_sink = None
         self._publisher = None
         self._publisher_stop = threading.Event()
@@ -77,23 +81,31 @@ class CameraRig:
         self._report_since = 0.0
         self._queue_peak = 0
 
-    def record_to(self, sink, capacity=32, *, diagnostics=False):
-        """Enable loss-intolerant capture delivery before starting cameras."""
+    def record_to(self, sink, capacity=32, *, diagnostics=False, queue_policy="strict"):
+        """Configure capture delivery before starting cameras."""
         if self._started:
             raise RuntimeError("Configure camera recording before start")
         if capacity < 1:
             raise ValueError("Camera recording queue capacity must be positive")
+        if queue_policy not in ("strict", "latest"):
+            raise ValueError("Camera recording queue policy must be strict or latest")
         self._record_sink = sink
-        self._record_queue = queue.Queue(maxsize=capacity)
-        if diagnostics:
+        self._record_diagnostics = diagnostics
+        self._record_queue = queue.Queue(maxsize=capacity) if queue_policy == "strict" else None
+        self._pending_cameras = OrderedDict() if queue_policy == "latest" else None
+        self._record_stats = None
+        if diagnostics or queue_policy == "latest":
             self._record_stats = {
                 name: dict(captured=0, published=0, overflow=0, publish_max_ms=0.0)
                 for name in self.selected
             }
+            if queue_policy == "latest":
+                for counts in self._record_stats.values():
+                    counts["overwritten"] = 0
             self._report_since = time.monotonic()
 
     def report_recording(self, *, final=False):
-        if self._record_stats is None:
+        if self._record_stats is None or (not final and not self._record_diagnostics):
             return
         now = time.monotonic()
         if not final and now - self._report_since < 1.0:
@@ -101,10 +113,14 @@ class CameraRig:
         self._report_since = now
         with self._lock:
             stats = {name: dict(counts) for name, counts in self._record_stats.items()}
-            size, peak = self._record_queue.qsize(), self._queue_peak
+            if self._pending_cameras is not None:
+                size, capacity = len(self._pending_cameras), len(self.selected)
+            else:
+                size, capacity = self._record_queue.qsize(), self._record_queue.maxsize
+            peak = self._queue_peak
         print(
             "[ROS cameras{}] queue={}/{} peak={}".format(
-                " final" if final else "", size, self._record_queue.maxsize, peak),
+                " final" if final else "", size, capacity, peak),
             file=sys.stderr, flush=True,
         )
         for name, counts in stats.items():
@@ -112,8 +128,12 @@ class CameraRig:
                 "captured={captured} published={published} overflow={overflow} "
                 "publish_max_ms={publish_max_ms:.1f}".format(**counts)
             )
+            overwritten = counts.get("overwritten", 0)
+            if "overwritten" in counts:
+                line += " overwritten={}".format(overwritten)
             if final:
-                line += " unpublished={}".format(counts["captured"] - counts["published"])
+                unpublished = counts["captured"] - counts["published"] - overwritten
+                line += " unpublished={}".format(unpublished)
             print("  {} {}".format(name, line), file=sys.stderr, flush=True)
 
     def _store_frame(self, name, frame):
@@ -121,7 +141,15 @@ class CameraRig:
             stats = self._record_stats[name] if self._record_stats is not None else None
             if stats is not None:
                 stats["captured"] += 1
-            if self._record_queue is not None and not self._publisher_stop.is_set():
+            if self._pending_cameras is not None and not self._publisher_stop.is_set():
+                # The frame group lives in the camera cache. Replacing it leaves
+                # this camera's position in the pending order intact.
+                if name in self._pending_cameras:
+                    stats["overwritten"] += 1
+                self._pending_cameras[name] = None
+                self._queue_peak = max(self._queue_peak, len(self._pending_cameras))
+                self._record_ready.notify()
+            elif self._record_queue is not None and not self._publisher_stop.is_set():
                 try:
                     self._record_queue.put_nowait((name, frame))
                 except queue.Full as exc:
@@ -140,11 +168,23 @@ class CameraRig:
             self._frames[name] = frame
 
     def _publish_frames(self):
-        while not self._publisher_stop.is_set() or not self._record_queue.empty():
-            try:
-                name, frame = self._record_queue.get(timeout=0.05)
-            except queue.Empty:
-                continue
+        while True:
+            if self._pending_cameras is not None:
+                with self._record_ready:
+                    self._record_ready.wait_for(
+                        lambda: self._pending_cameras or self._publisher_stop.is_set()
+                    )
+                    if not self._pending_cameras:
+                        return
+                    name, _ = self._pending_cameras.popitem(last=False)
+                    frame = self._frames[name]
+            else:
+                if self._publisher_stop.is_set() and self._record_queue.empty():
+                    return
+                try:
+                    name, frame = self._record_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
             if self._record_stats is not None:
                 started = time.monotonic()
             try:
@@ -355,8 +395,9 @@ class CameraRig:
         for thread in self._threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         still_running = [thread.name for thread in self._threads if thread.is_alive()]
-        with self._lock:
+        with self._record_ready:
             self._publisher_stop.set()
+            self._record_ready.notify()
         if self._publisher is not None:
             self._publisher.join(timeout=publish_timeout)
             if self._publisher.is_alive():

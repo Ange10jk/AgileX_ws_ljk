@@ -367,6 +367,11 @@ def validate_config(config):
     record.setdefault("camera_in_ros_worker", False)
     if not isinstance(record["camera_in_ros_worker"], bool):
         raise ConfigError("record.camera_in_ros_worker must be a YAML boolean")
+    queue_policy = record.setdefault("camera_queue_policy", "strict")
+    if queue_policy not in ("strict", "latest"):
+        raise ConfigError("record.camera_queue_policy must be strict or latest")
+    if queue_policy == "latest" and not record["camera_in_ros_worker"]:
+        raise ConfigError("record.camera_queue_policy=latest requires record.camera_in_ros_worker=true")
     if record["camera_in_ros_worker"]:
         if record["backend"] != "ros_publish" or WORKFLOWS[flow["mode"]].uses_policy:
             raise ConfigError("record.camera_in_ros_worker requires collect/teleop with ros_publish")
@@ -434,6 +439,7 @@ def describe(config):
         "control_hz": config["robot"]["control_hz"],
         "record_backend": config["record"]["backend"],
         "camera_in_ros_worker": config["record"].get("camera_in_ros_worker", False),
+        "camera_queue_policy": config["record"].get("camera_queue_policy", "strict"),
         "record_topics_config": config["record"].get("topics_config"),
         "output_dir": (
             None if config["record"]["backend"] == "ros_publish"

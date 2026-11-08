@@ -307,6 +307,14 @@ class CollectionProcessTests(unittest.TestCase):
                 "workflow": {"max_episode_sec": 120},
             })
 
+    def test_latest_camera_queue_policy_requires_worker_cameras(self):
+        path = ROOT / "configs" / "collect_dual_RoboDojo.yaml"
+        self.assertEqual(load_config(path)["record"]["camera_queue_policy"], "strict")
+        with self.assertRaisesRegex(ConfigError, "camera_queue_policy must be strict or latest"):
+            load_config(path, {"record": {"camera_queue_policy": "fifo"}})
+        with self.assertRaisesRegex(ConfigError, "latest requires record.camera_in_ros_worker=true"):
+            load_config(path, {"record": {"camera_queue_policy": "latest"}})
+
     def test_worker_waits_for_all_cameras_and_reports_idle_disconnect(self):
         with tempfile.TemporaryDirectory() as root:
             cfg = self.worker_camera_config(root)
@@ -393,13 +401,38 @@ class CollectionProcessTests(unittest.TestCase):
                 self.assertEqual(client.process.returncode, 1)
                 self.assertFalse({"unregistered", "closed"} & {row["kind"] for row in self.audit(root)})
 
-    def test_worker_camera_publish_error_blocks_readiness(self):
-        with tempfile.TemporaryDirectory() as root:
-            client = self.factory(root)(self.worker_camera_config(root, test_fail_publish=True), None)
-            with self.assertRaisesRegex(CollectionError, "Publishing camera .* image publish failed"):
+    def test_latest_worker_reports_overwrites_on_close_without_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryFile(mode="w+") as stderr:
+            cfg = self.worker_camera_config(root, camera_queue_policy="latest")
+            client = self.factory(root)(cfg, None)
+            popen = subprocess.Popen
+            with mock.patch("piper_control.recording.client.subprocess.Popen",
+                            side_effect=lambda *args, **kwargs: popen(*args, stderr=stderr, **kwargs)):
                 client.start()
-            self.assertIsNotNone(client.process.returncode)
-            self.assertEqual(self.audit(root)[-1]["kind"], "closed")
+            client.close()
+
+            audit = self.audit(root)
+            self.assertEqual(audit[-1]["kind"], "closed")
+            self.assertEqual(client.process.returncode, 0)
+            stderr.seek(0)
+            report = stderr.read()
+            self.assertEqual(report.count("[ROS cameras final]"), 1)
+            for name in ("cam_h", "cam_l", "cam_r"):
+                stamps = [row["payload"][name]["stamp"] for row in audit
+                          if row["kind"] == "images" and name in row["payload"]]
+                self.assertEqual(stamps, sorted(set(stamps)))
+                self.assertEqual(stamps[-1], 12.0)
+                self.assertRegex(report, rf"{name} captured=3 .* overwritten=\d+ unpublished=0")
+
+    def test_worker_camera_publish_error_blocks_readiness(self):
+        for policy in ("strict", "latest"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as root:
+                cfg = self.worker_camera_config(root, camera_queue_policy=policy, test_fail_publish=True)
+                client = self.factory(root)(cfg, None)
+                with self.assertRaisesRegex(CollectionError, "Publishing camera .* image publish failed"):
+                    client.start()
+                self.assertIsNotNone(client.process.returncode)
+                self.assertEqual(self.audit(root)[-1]["kind"], "closed")
 
     def test_human_worker_cameras_do_not_construct_parent_rig_or_enqueue_images(self):
         with tempfile.TemporaryDirectory() as root:
