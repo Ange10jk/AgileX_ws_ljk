@@ -362,6 +362,23 @@ def validate_config(config):
     record.setdefault("command_timeout_sec", 5.0)
     for key in ("startup_timeout_sec", "command_timeout_sec"):
         _positive(record[key], "record." + key)
+    if not isinstance(record.get("queue_diagnostics", False), bool):
+        raise ConfigError("record.queue_diagnostics must be a YAML boolean")
+    record.setdefault("camera_in_ros_worker", False)
+    if not isinstance(record["camera_in_ros_worker"], bool):
+        raise ConfigError("record.camera_in_ros_worker must be a YAML boolean")
+    if record["camera_in_ros_worker"]:
+        if record["backend"] != "ros_publish" or WORKFLOWS[flow["mode"]].uses_policy:
+            raise ConfigError("record.camera_in_ros_worker requires collect/teleop with ros_publish")
+        if not selected:
+            raise ConfigError("record.camera_in_ros_worker requires at least one selected camera")
+        capacity = record.get("camera_queue_size", 32)
+        if type(capacity) is not int or capacity < 1:
+            raise ConfigError("record.camera_queue_size must be a positive integer")
+        camera_timeout = obs.get("startup_timeout_sec", 15.0)
+        _positive(camera_timeout, "observation.startup_timeout_sec")
+        if float(record["startup_timeout_sec"]) <= float(camera_timeout):
+            raise ConfigError("record.startup_timeout_sec must exceed observation.startup_timeout_sec")
     for key, default in (
         ("queue_size", 256),
         ("min_free_gb", 2.0),
@@ -416,6 +433,7 @@ def describe(config):
         "policy_hz": config["workflow"]["policy_hz"],
         "control_hz": config["robot"]["control_hz"],
         "record_backend": config["record"]["backend"],
+        "camera_in_ros_worker": config["record"].get("camera_in_ros_worker", False),
         "record_topics_config": config["record"].get("topics_config"),
         "output_dir": (
             None if config["record"]["backend"] == "ros_publish"

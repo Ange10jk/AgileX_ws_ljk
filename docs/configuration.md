@@ -141,6 +141,65 @@ python scripts/record.py --config configs/collect_right.yaml \
 
 仍保留模型名称／维度／单位校验、子进程请求超时和采集写入错误处理；这些用于让模型加载、进程通信和数据保存的错误明确报出。退出及显式 `stop` 仍调用 SDK 停止。
 
+### RoboDojo 的 ROS 子进程相机采集
+
+`record.camera_in_ros_worker` 默认为 `false`，使用控制进程采集和转发图像。此开关适用于 `collect`、`teleop` 与 `ros_publish` 的组合。操作员可在 `configs/RoboDojo/collect_stand_up_bottles.yaml` 的 `record` 下启用：
+
+```yaml
+record:
+  queue_size: 256
+  queue_diagnostics: false
+  camera_in_ros_worker: true
+  python: ~/.venvs/piper-ros-realsense/bin/python
+```
+
+上面的解释器是 robot 上准备的隔离环境。控制终端仍可使用 `conda activate piper-control`，ROS 子进程和手动录包按 `record.python` 启动。运行 `scripts/check_config.py` 核对开关、三个相机和频率。回滚时退出会话，设回 `false`、移除任务配置中的 `record.python` 覆盖，再重启。动作频率由 `workflow.policy_hz` 控制，相机目标为 30 FPS。
+
+ROS 子进程会等每台所选相机成功发布第一组有效帧再报告就绪。相机等待上限为 `observation.startup_timeout_sec`（默认 15 秒），同一个超时也用于运行时检测持续收不到有效帧组。外层 `record.startup_timeout_sec`（默认 20 秒）还包含 ROS 初始化，须留出余量。子进程处理回合结束事件时，从相机缓存读取最近的 RGB 采集时间戳。逐帧分析应读 bag 中的原始图像头。
+
+子进程的 `record.camera_queue_size` 默认容纳 32 组帧，图像与 `camera_info` 使用同步 ROS 发布。相机故障和队列溢出会立即通过 IPC 上报，错误包含相机名，溢出时也会列出队列容量。排查性能时可设 `record.queue_diagnostics: true`，在终端 B 查看父进程队列与子进程的队列水位、溢出数、发布耗时及退出汇总。该选项默认关闭。发布计数反映本地发布调用，录包验收应以 bag 为准。正常退出时子进程先排空相机队列再注销 ROS publisher。发布线程退出超时时，子进程报错并直接退出，由系统关闭连接。
+
+#### 检查实际 bag 的九路图像
+
+使用录制终端已关闭的 `data.bag`。下面的命令使用每条图像的 `header.stamp`，同时列出状态与动作的时间覆盖。按录包顺序检查重复、回退以及大于两个 30 FPS 帧周期（约 66.67 ms）的缺口，输出的 `from`、`to` 为采集时间戳（秒）。
+
+```bash
+source /opt/ros/noetic/setup.bash
+/usr/bin/python3 - /path/to/episode/data.bag <<'PY'
+import sys
+import rosbag
+
+prefix = "/piper"
+images = [
+    f"{prefix}/cameras/{camera}/{stream}/image_raw"
+    for camera in ("cam_h", "cam_l", "cam_r")
+    for stream in ("color", "depth", "aligned_depth_to_color")
+]
+topics = images + [prefix + "/state", prefix + "/action"]
+stamps = {topic: [] for topic in topics}
+with rosbag.Bag(sys.argv[1]) as bag:
+    for topic, msg, _ in bag.read_messages(topics=topics):
+        stamps[topic].append(msg.header.stamp.to_nsec())
+
+for topic, values in stamps.items():
+    if not values:
+        print(f"{topic} MISSING")
+        continue
+    span = (values[-1] - values[0]) / 1e9
+    fps = f"{(len(values) - 1) / span:.2f}" if span > 0 else "-"
+    print(f"{topic} n={len(values)} span_s={span:.3f} fps={fps}"
+          f" first={values[0] / 1e9:.9f} last={values[-1] / 1e9:.9f}")
+    for previous, current in zip(values, values[1:]):
+        delta = current - previous
+        if delta <= 0 or (topic in images and delta * 30 > 2_000_000_000):
+            kind = "NON_INCREASING" if delta <= 0 else "GAP"
+            print(f"  {kind} from={previous / 1e9:.9f} to={current / 1e9:.9f}"
+                  f" delta_ms={delta / 1e6:.3f}")
+PY
+```
+
+以每路平均至少 29 FPS 为初步门槛，逐条核对缺口，比较图像与状态、动作的首尾时间及覆盖区间。结合 `manifest.json`、`rosbag.log` 和两端队列日志判断问题出在相机、ROS 发布还是录包。按计划在同一分辨率、动作频率和时长下对比旧路径 15 FPS 与新路径 30 FPS，并分别检查只发布和同时录包的表现。
+
 ## 模型与 learner
 
 `policy.type` 选择 LeRobot 注册模型，再加载匹配 checkpoint。两者类型不同会在使能前失败。需要历史观测或时间集成的模型走逐步接口；具备明确能力契约的模型可走 chunk 接口。RTC 和无法转换成当前绝对关节动作定义的模型不会被隐式兼容。

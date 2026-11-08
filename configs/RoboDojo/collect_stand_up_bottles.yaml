@@ -6,10 +6,14 @@ observation:
   fps: 30
 
 workflow:
-  policy_hz: 15
+  policy_hz: 30
 
 robot:
   control_hz: 30
 
 record:
   queue_size: 256
+  queue_diagnostics: true
+  # Opt in after checking the ROS Python environment (see docs/configuration.md).
+  camera_in_ros_worker: true
+  python: /home/robot/.venvs/piper-ros-realsense/bin/python

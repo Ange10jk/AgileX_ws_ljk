@@ -3,6 +3,7 @@
 This module has no ROS imports. Replies acknowledge collection operations; no
 worker response is a robot command or is passed to the hardware executor.
 """
+from collections import Counter
 import os
 from pathlib import Path
 import queue
@@ -31,6 +32,7 @@ class CollectorClient:
         self._enqueue_lock = threading.Lock()
         self._sequence = 0
         self._error = None
+        self._worker_reported_error = False
         self._closing = False
         self._closed = False
         self._close_ack = threading.Event()
@@ -38,6 +40,35 @@ class CollectorClient:
         self._reader_thread = None
         self._image_stamps = {}
         self._active_message = None
+        self._queue_stats_lock = threading.Lock() if self.options.get("queue_diagnostics", False) else None
+        self._queue_stats_since = time.monotonic()
+        self._enqueued = Counter()
+        self._acked = Counter()
+        self._image_ack_max = 0.0
+
+    def _report_queue(self):
+        with self._queue_stats_lock:
+            now = time.monotonic()
+            elapsed = now - self._queue_stats_since
+            if elapsed < 1.0:
+                return
+            enqueued, acked = self._enqueued, self._acked
+            image_ack_max = self._image_ack_max
+            self._queue_stats_since = now
+            self._enqueued, self._acked = Counter(), Counter()
+            self._image_ack_max = 0.0
+        kinds = sorted(enqueued.keys() | acked.keys())
+        rates = " ".join(
+            "{}={:.1f}/{:.1f}".format(kind, enqueued[kind] / elapsed, acked[kind] / elapsed)
+            for kind in kinds
+        )
+        image_ack = "{:.1f}".format(image_ack_max * 1000) if acked["images"] else "-"
+        print(
+            "[采集队列] {}/{} in/ack(/s) {} image_ack_max_ms={}".format(
+                self.queue.qsize(), self.queue.maxsize, rates, image_ack
+            ),
+            file=sys.stderr, flush=True,
+        )
 
     def _argv(self):
         python = self.options.get("python") or sys.executable
@@ -62,8 +93,11 @@ class CollectorClient:
             # catkin workspace or the control interpreter's Python packages.
             for key in ("PYTHONPATH", "ROS_PACKAGE_PATH", "CMAKE_PREFIX_PATH"):
                 env.pop(key, None)
-        self.process = subprocess.Popen(self._argv(), cwd=str(Path(__file__).resolve().parents[2]),
-                                        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        self.process = subprocess.Popen(
+            self._argv(), cwd=str(Path(__file__).resolve().parents[2]),
+            env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
+            start_new_session=self.options.get("camera_in_ros_worker", False),
+        )
         self._reader_thread = threading.Thread(target=self._read, name="collection-ack", daemon=True)
         self._reader_thread.start()
         try:
@@ -86,6 +120,11 @@ class CollectorClient:
         try:
             while not self._closed:
                 reply = read_message(self.process.stdout)
+                if reply.get("kind") == "error":
+                    self._worker_reported_error = True
+                    self._error = CollectionError("Collection worker: " + str(reply["error"]))
+                    self.replies.put_nowait(reply)
+                    return
                 self.replies.put_nowait(reply)
                 if reply.get("kind") == "closed":
                     return
@@ -111,11 +150,15 @@ class CollectorClient:
 
     def _write(self):
         try:
-            while True:
-                message = self.queue.get()
-                self._active_message = (message["kind"], time.monotonic())
+            while self._error is None and not self._closed:
+                try:
+                    message = self.queue.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                kind, started = message["kind"], time.monotonic()
+                self._active_message = (kind, started)
                 write_message(self.process.stdin, message)
-                closing = message["kind"] == "close"
+                closing = kind == "close"
                 reply = self._reply(self.shutdown_timeout if closing else self.timeout)
                 if reply.get("seq") != message["seq"] or reply.get("kind") != ("closed" if closing else "ack"):
                     raise CollectionError("Collection acknowledgement does not match submitted input")
@@ -123,8 +166,14 @@ class CollectorClient:
                 if closing:
                     self._close_ack.set()
                     return
+                if self._queue_stats_lock is not None:
+                    with self._queue_stats_lock:
+                        self._acked[kind] += 1
+                        if kind == "images":
+                            self._image_ack_max = max(self._image_ack_max, time.monotonic() - started)
         except Exception as exc:
-            self._error = exc
+            if self._error is None:
+                self._error = exc
 
     def _enqueue(self, kind, payload):
         # Copy before taking the lock so large frames do not block control
@@ -142,6 +191,11 @@ class CollectorClient:
             except queue.Full as exc:
                 self._error = CollectionError("Collection queue is full; recording cannot silently drop samples")
                 raise self._error from exc
+            if self._queue_stats_lock is not None:
+                with self._queue_stats_lock:
+                    self._enqueued[kind] += 1
+        if self._queue_stats_lock is not None:
+            self._report_queue()
 
     def publish_state(self, snapshot):
         self._enqueue("state", snapshot)
@@ -182,8 +236,15 @@ class CollectorClient:
     def _terminate(self):
         if self.process is None:
             return
+        if (self._worker_reported_error and self.options.get("camera_in_ros_worker", False)
+                and self.process.poll() is None):
+            # The worker sent its fault before stopping capture and closing ROS.
+            try:
+                self.process.wait(timeout=min(self.shutdown_timeout, 10.0))
+            except subprocess.TimeoutExpired:
+                pass
         if self.process.poll() is None:
-            # Worker SIGTERM handler closes its ROS bag in finally.
+            # Worker SIGTERM handler closes its resources in finally.
             self.process.terminate()
             try:
                 self.process.wait(timeout=self.shutdown_timeout)

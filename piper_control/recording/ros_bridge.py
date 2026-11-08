@@ -196,9 +196,15 @@ class ROSBridge:
             raise RuntimeError("ROS bridge is not running")
         self.check_health()
         topic = self.prefix + "/" + suffix.strip("/")
+        direct_image = kind in ("image", "info") and self.config.get("camera_in_ros_worker", False)
         if topic not in self._publishers:
+            queue_size = 2 if kind == "image" else 10
+            if direct_image:
+                # Let CameraRig's bounded queue report backpressure. rospy's
+                # asynchronous queues discard old messages when full.
+                queue_size = None
             self._publishers[topic] = self.rospy.Publisher(
-                topic, self.messages[kind], queue_size=2 if kind == "image" else 10)
+                topic, self.messages[kind], queue_size=queue_size)
         if self._bag is not None:
             self._bag.put(topic, message, stamp)
         self._publishers[topic].publish(message)

@@ -2,12 +2,14 @@
 import numpy as np
 
 
-def make_observation(config, snapshot, frames):
+def make_observation(config, snapshot, frames, *, include_images=True):
     state = np.asarray(snapshot["state"], dtype=np.float32)
     if state.shape != (7 * len(config["robot"]["arms"]),) or not np.isfinite(state).all():
         raise ValueError("Invalid follower state for policy observation")
     result = {"observation.state": state.copy(), "task": config["observation"]["task"],
               "timestamp": snapshot["stamp"]}
+    if not include_images:
+        return result
     for feature, name in config["observation"]["camera_map"].items():
         if name not in frames:
             raise ValueError("Missing camera: %s" % name)

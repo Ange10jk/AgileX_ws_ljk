@@ -43,9 +43,11 @@ class Session:
         self.cfg, self.mock = config, mock
         self.workflow = get_workflow(config["workflow"]["mode"])
         self.robot = robot or (MockRobot if mock else SDKRobot)(config["robot"])
-        self.cameras = cameras or (MockCameras if mock else CameraRig)(
-            config["observation"]
-        )
+        self.cameras = None
+        if not config["record"].get("camera_in_ros_worker", False):
+            self.cameras = cameras or (MockCameras if mock else CameraRig)(
+                config["observation"]
+            )
         self.policy = policy
         self.recording = recording or RecordingSession(config)
         self.controller = Controller(config, self.robot, self.event)
@@ -102,7 +104,8 @@ class Session:
                 self.recording.publish_images,
                 capacity=int(self.cfg["record"].get("camera_queue_size", 32)))
             self._camera_recording = True
-        self.cameras.start()
+        if self.cameras is not None:
+            self.cameras.start()
         if self.workflow.uses_policy:
             if self.learning and self.recording.directory is not None:
                 options = self.cfg["workflow"].setdefault("rlt", {})
@@ -116,12 +119,16 @@ class Session:
         self.robot.connect()
         manual_auto = self.cfg["workflow"].get("auto_start", False) and not self.workflow.uses_policy
         if manual_auto:
+            if self.cameras is None:
+                self.recording.check_health()
             if self.controller.abort.is_set():
                 raise ControlError("Stop requested before enabling")
             print("[启动] 将主臂切回 follower 以读取状态，检查驱动并按需恢复电子停止。", flush=True)
             self.robot.prepare_human_start(stop_requested=self.controller.abort.is_set)
             print("[启动] 恢复检查已完成，正在使能并发送 JS 对齐目标。", flush=True)
         # Load process resources before starting SDK control.
+        if self.cameras is None:
+            self.recording.check_health()
         self.controller.start()
         self.started = True
         if manual_auto:
@@ -144,6 +151,14 @@ class Session:
         )
         return self
 
+    def _camera_snapshot(self):
+        return self.cameras.snapshot() if self.cameras is not None else {}
+
+    def _observation(self, snapshot, frames):
+        return make_observation(
+            self.cfg, snapshot, frames, include_images=self.cameras is not None
+        )
+
     def _invalidate_policy(self):
         if self.policy:
             self.policy.invalidate(self.controller.generation)
@@ -155,7 +170,7 @@ class Session:
         if self.pending is None:
             return
         step = dict(self.pending)
-        next_obs = make_observation(self.cfg, snapshot, frames)
+        next_obs = self._observation(snapshot, frames)
         step["next_observation"] = _stored_observation(snapshot, frames)
         step["duration_sec"] = max(0.0, time.monotonic() - step.pop("_started"))
         before_obs = step.pop("_policy_observation")
@@ -259,7 +274,7 @@ class Session:
             self._log("command_rejected", command=command, reason="unknown command")
 
     def end_episode(self, snapshot, frames, terminal, truncated, reward, success):
-        final_obs = make_observation(self.cfg, snapshot, frames)
+        final_obs = self._observation(snapshot, frames)
         self._finish_step(
             snapshot, frames, terminal=terminal, truncated=truncated, reward=reward
         )
@@ -306,7 +321,7 @@ class Session:
 
     def _policy_tick(self, snapshot, frames):
         self._finish_step(snapshot, frames)
-        observation = make_observation(self.cfg, snapshot, frames)
+        observation = self._observation(snapshot, frames)
         self.last_observation = observation
         step = self.controller.step(snapshot)
         if step is not None:
@@ -445,17 +460,18 @@ class Session:
                 now = time.monotonic()
                 policy_due = collect_on_control_tick or now >= next_policy
                 self.recording.check_health()
-                self.cameras.check_health()
+                if self.cameras is not None:
+                    self.cameras.check_health()
                 self._poll()
-                snapshot, frames = self.robot.snapshot(), self.cameras.snapshot()
+                snapshot, frames = self.robot.snapshot(), self._camera_snapshot()
                 self.recording.publish_state(snapshot)
-                if not self._camera_recording:
+                if self.cameras is not None and not self._camera_recording:
                     self.recording.publish_images(frames)
                 self.controller.tick(snapshot)
                 if auto:
                     self.command(self.workflow.initial_command, snapshot, frames)
                     auto = False
-                    snapshot, frames = self.robot.snapshot(), self.cameras.snapshot()
+                    snapshot, frames = self.robot.snapshot(), self._camera_snapshot()
                 while self.schedule and now - started >= self.schedule[0][0]:
                     _, command = self.schedule.pop(0)
                     self.commands.put(command)
@@ -463,7 +479,7 @@ class Session:
                     self.command(self.commands.get_nowait(), snapshot, frames)
                     if self.quit:
                         break
-                    snapshot, frames = self.robot.snapshot(), self.cameras.snapshot()
+                    snapshot, frames = self.robot.snapshot(), self._camera_snapshot()
                 if (
                     self.episode_active
                     and episode_limit is not None

@@ -57,7 +57,7 @@ conda activate piper-control
 PIPER_CONFIG=configs/RoboDojo/collect_stand_up_bottles.yaml
 export ROS_MASTER_URI=http://localhost:11311
 python scripts/record.py --config "$PIPER_CONFIG" --list-topics
-python scripts/record.py --config "$PIPER_CONFIG" --output ~/luojk/datasets/stand_up_bottles/episode_0005/
+python scripts/record.py --config "$PIPER_CONFIG" --output ~/luojk/datasets/stand_up_bottles/episode_30fps_action30_new_log/
 ```
 
 `--list-topics` 只展开清单，不连接机械臂。录制终端显示启动后，先确认 `rostopic list` 中有预期 `/piper/...` 话题，再开始示教。每段结束在**终端 C 按 Ctrl+C**，等待脚本打印 `Saved: .../data.bag` 且退出码为 0，再检查清单；不要直接杀死 rosbag 或关闭终端。下一条用 `episode_0002` 等新目录重新运行录包命令，终端 B 的主从进程可持续运行。更换任务时，先在控制终端输入 `q` 回车退出，再切换任务 YAML、复位场景并重启控制进程。

@@ -14,7 +14,7 @@ from unittest import mock
 
 import numpy as np
 
-from piper_control.config import load_config
+from piper_control.config import ConfigError, load_config
 from piper_control.hardware.cameras import CameraRig
 from piper_control.ipc import _decode, _owned, read_message, write_message
 from piper_control.recording.client import CollectionError, CollectorClient
@@ -25,15 +25,17 @@ from piper_control.workflows.session import Session
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE_WORKER = '''
-import sys, json, signal, time
+import sys, json, time, types
 from pathlib import Path
 sys.path.insert(0, ROOT_PATH)
 from piper_control.ipc import _encode
-from piper_control.recording.ros_worker import serve
+from piper_control.recording import ros_worker
+serve = ros_worker.serve
 class Bridge:
     def __init__(self, cfg):
         self.options=cfg['record']
         self.path=None
+        self._publish_bridge = None
     def start(self):
         if self.options['backend']=='ros_publish':
             self.path=Path(self.options['output_dir'])
@@ -45,7 +47,30 @@ class Bridge:
         with (self.path/'collector.audit.jsonl').open('a') as f:
             f.write(json.dumps({'kind':kind, 'payload':payload}, default=_encode)+'\\n')
     def publish_state(self, data): self.log('state', data)
-    def publish_images(self, data): self.log('images', data)
+    def publish_images(self, data):
+        if self.options.get('test_fail_publish'):
+            raise OSError('image publish failed')
+        if any(frame["stamp"] == 20.0 for frame in data.values()):
+            from piper_control.recording.ros_bridge import ROSBridge
+            self._publish_bridge = ROSBridge({"record": self.options})
+            self._publish_bridge._started = True
+            self._publish_bridge.messages = {"image": object}
+
+            def blocked_publish(message):
+                (self.path / "publish_blocked").touch()
+                while not (self.path / "release_publish").exists():
+                    time.sleep(0.005)
+
+            def create_publisher(*args, queue_size):
+                assert queue_size is None
+                return types.SimpleNamespace(
+                    publish=blocked_publish, unregister=lambda: self.log('unregistered', {}),
+                )
+            self._publish_bridge.rospy = types.SimpleNamespace(
+                Publisher=create_publisher, is_shutdown=lambda: False,
+            )
+            self._publish_bridge._emit("cameras/cam_r/color/image_raw", "image", object(), None)
+        self.log('images', data)
     def publish_action(self, action, source, metadata): self.log('action', {'action':action,'source':source})
     def publish_event(self, data):
         if data.get('type')=='fail': raise OSError('collector disk failed')
@@ -53,12 +78,57 @@ class Bridge:
         self.log('event',data)
     def check_health(self): pass
     def close(self):
+        if self._publish_bridge is not None:
+            self._publish_bridge.close()
         manifest=json.loads((self.path/'manifest.json').read_text()) if (self.path/'manifest.json').exists() else {}
         self.log('closed', {'manifest_status':manifest.get('status'),
             'hardware_imports':[m for m in sys.modules if m.startswith('piper_control.hardware')]})
-def stop(*args): raise SystemExit(143)
-signal.signal(signal.SIGTERM,stop)
-serve(sys.stdin.buffer,sys.stdout.buffer,bridge_factory=Bridge)
+def cameras(observation):
+    from piper_control.hardware.cameras import CameraRig
+    sys.modules['pyrealsense2'] = types.ModuleType('pyrealsense2')
+    root = Path(__file__).parent
+    class TestRig(CameraRig):
+        def close(self, *, publish_timeout):
+            if observation.get('test_short_publish_timeout'):
+                publish_timeout = 0.05
+            super().close(publish_timeout=publish_timeout)
+
+        def _capture(self, name, config, rs, np):
+            if name == 'cam_r' and observation.get('test_delay_right'):
+                while not self._stop.wait(0.005) and not (root/'release_right').exists():
+                    pass
+                if self._stop.is_set():
+                    return
+            pixels = np.zeros((2, 3, 3), dtype=np.uint8)
+            for stamp in (10.0, 11.0):
+                self._store_frame(name, {'stamp': stamp, 'rgb': pixels})
+            while not self._stop.wait(0.005):
+                if name == 'cam_r' and ((root/'overflow').exists() or (root/'block_publish').exists()):
+                    self._store_frame(name, {'stamp': 20.0, 'rgb': pixels})
+                    if (root/'block_publish').exists():
+                        self._stop.wait()
+                        return
+                    while not self._stop.wait(0.005) and not (root/'publish_blocked').exists():
+                        pass
+                    try:
+                        for stamp in range(21, 41):
+                            self._store_frame(name, {'stamp': float(stamp), 'rgb': pixels})
+                    except RuntimeError as exc:
+                        with self._lock:
+                            self._errors[name] = exc
+                        return
+                if (root/'disconnect').exists() and name == 'cam_l':
+                    with self._lock:
+                        self._errors[name] = RuntimeError('test camera disconnected')
+                    return
+            if not (root/'overflow').exists():
+                self._store_frame(name, {'stamp': 12.0, 'rgb': pixels})
+    return TestRig(observation)
+
+ros_worker.serve = lambda incoming, outgoing, poll_input: serve(
+    incoming, outgoing, bridge_factory=Bridge, camera_factory=cameras, poll_input=poll_input,
+)
+ros_worker.main()
 '''
 
 
@@ -211,6 +281,160 @@ class CollectionProcessTests(unittest.TestCase):
             stamps = [row["payload"]["cam_h"]["stamp"] for row in audit if row["kind"] == "images"]
             self.assertEqual(stamps, [1.0, 2.0, 3.0])
             self.assertEqual(audit[-1]["kind"], "closed")
+
+    def worker_camera_config(self, root, **options):
+        record = dict(self.config(root, "ros_publish")["record"], camera_in_ros_worker=True, **options)
+        return load_config(ROOT / "configs" / "RoboDojo" / "collect_stand_up_bottles.yaml", {
+            "observation": {"startup_timeout_sec": 1.5},
+            "record": record,
+        })
+
+    def audit(self, root):
+        return [json.loads(line) for line in
+                (Path(root) / "collector.audit.jsonl").read_text().splitlines()]
+
+    def test_worker_camera_option_is_opt_in_and_rejects_pixel_workflows(self):
+        path = ROOT / "configs" / "collect_dual_RoboDojo.yaml"
+        self.assertFalse(load_config(path)["record"]["camera_in_ros_worker"])
+        with self.assertRaisesRegex(ConfigError, "requires collect/teleop with ros_publish"):
+            load_config(path, {
+                "record": {"camera_in_ros_worker": True},
+                "workflow": {"mode": "deploy", "max_episode_sec": 120},
+            })
+        with self.assertRaisesRegex(ConfigError, "requires collect/teleop with ros_publish"):
+            load_config(path, {
+                "record": {"camera_in_ros_worker": True, "backend": "ros"},
+                "workflow": {"max_episode_sec": 120},
+            })
+
+    def test_worker_waits_for_all_cameras_and_reports_idle_disconnect(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self.worker_camera_config(root)
+            cfg["observation"]["test_delay_right"] = True
+            client = self.factory(root)(cfg, None)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                started = executor.submit(client.start)
+                try:
+                    deadline = time.monotonic() + 2.
+                    path = Path(root) / "collector.audit.jsonl"
+                    while time.monotonic() < deadline:
+                        if path.exists() and '"cam_l"' in path.read_text():
+                            break
+                        time.sleep(0.01)
+                    self.assertIn('"cam_l"', path.read_text())
+                    self.assertFalse(started.done())
+                finally:
+                    (Path(root) / "release_right").touch()
+                    started.result(timeout=4.)
+
+            try:
+                for name in ("cam_h", "cam_l", "cam_r"):
+                    self.assertTrue(any(name in row["payload"] for row in self.audit(root)
+                                        if row["kind"] == "images"))
+                (Path(root) / "disconnect").touch()
+                client._reader_thread.join(timeout=2.)
+                with self.assertRaisesRegex(CollectionError, "cam_l.*test camera disconnected"):
+                    client.check_health()
+            finally:
+                with self.assertRaisesRegex(CollectionError, "cam_l.*test camera disconnected"):
+                    client.close()
+            client._writer_thread.join(timeout=1.)
+            self.assertFalse(client._writer_thread.is_alive())
+            self.assertEqual(self.audit(root)[-1]["kind"], "closed")
+
+    def test_worker_reports_overflow_before_a_blocked_publish_finishes(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryFile(mode="w+") as stderr:
+            cfg = self.worker_camera_config(root, camera_queue_size=8, queue_diagnostics=False)
+            client = self.factory(root)(cfg, None)
+            popen = subprocess.Popen
+            with mock.patch("piper_control.recording.client.subprocess.Popen",
+                            side_effect=lambda *args, **kwargs: popen(*args, stderr=stderr, **kwargs)):
+                client.start()
+
+            try:
+                (Path(root) / "overflow").touch()
+                client._reader_thread.join(timeout=2.)
+                with self.assertRaisesRegex(CollectionError, "cam_r.*queue full.*capacity 8"):
+                    client.check_health()
+                self.assertNotIn("unregistered", [row["kind"] for row in self.audit(root)])
+            finally:
+                (Path(root) / "release_publish").touch()
+                with self.assertRaisesRegex(CollectionError, "cam_r.*queue full"):
+                    client.close()
+            audit = self.audit(root)
+            self.assertEqual([row["kind"] for row in audit[-2:]], ["unregistered", "closed"])
+            self.assertIn(28.0, [row["payload"]["cam_r"]["stamp"] for row in audit
+                                 if row["kind"] == "images" and "cam_r" in row["payload"]])
+            self.assertFalse((Path(root) / "diagnostics").exists())
+            stderr.seek(0)
+            self.assertEqual(stderr.read(), "")
+
+    def test_worker_exits_without_unregistering_a_blocked_publisher(self):
+        for trigger, error in (
+            ("block_publish", "Camera recording shutdown timed out"),
+            ("overflow", "cam_r.*queue full"),
+        ):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as root:
+                cfg = self.worker_camera_config(root, camera_queue_size=8)
+                cfg["observation"]["test_short_publish_timeout"] = True
+                client = self.factory(root)(cfg, None).start()
+                (Path(root) / trigger).touch()
+                try:
+                    deadline = time.monotonic() + 2.
+                    blocked = Path(root) / "publish_blocked"
+                    while not blocked.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(blocked.exists())
+                    if trigger == "overflow":
+                        client._reader_thread.join(timeout=2.)
+                finally:
+                    with self.assertRaisesRegex(CollectionError, error):
+                        client.close()
+                self.assertEqual(client.process.returncode, 1)
+                self.assertFalse({"unregistered", "closed"} & {row["kind"] for row in self.audit(root)})
+
+    def test_worker_camera_publish_error_blocks_readiness(self):
+        with tempfile.TemporaryDirectory() as root:
+            client = self.factory(root)(self.worker_camera_config(root, test_fail_publish=True), None)
+            with self.assertRaisesRegex(CollectionError, "Publishing camera .* image publish failed"):
+                client.start()
+            self.assertIsNotNone(client.process.returncode)
+            self.assertEqual(self.audit(root)[-1]["kind"], "closed")
+
+    def test_human_worker_cameras_do_not_construct_parent_rig_or_enqueue_images(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self.worker_camera_config(root)
+            factory = self.factory(root)
+
+            def tracked_client(config, directory):
+                client = factory(config, directory)
+                client._enqueue = mock.Mock(wraps=client._enqueue)
+                return client
+
+            recording = RecordingSession(cfg, collector_factory=tracked_client)
+            with mock.patch("piper_control.workflows.session.MockCameras") as parent_rig:
+                session = Session(cfg, mock=True, recording=recording)
+                result = session.run(max_steps=2, max_seconds=2., interactive=False)
+            parent_rig.assert_not_called()
+            self.assertIsNone(session.cameras)
+            self.assertFalse(session._camera_recording)
+            self.assertEqual(result["steps"], 2)
+            self.assertEqual(
+                {call.args[0] for call in recording.collector._enqueue.call_args_list},
+                {"state", "action", "event"},
+            )
+            audit = self.audit(root)
+            for name in ("cam_h", "cam_l", "cam_r"):
+                stamps = [row["payload"][name]["stamp"] for row in audit
+                          if row["kind"] == "images" and name in row["payload"]]
+                self.assertEqual(stamps, [10.0, 11.0, 12.0])
+            events = [row["payload"] for row in audit if row["kind"] == "event"]
+            final = next(event["final_observation"] for event in events
+                         if event["type"] == "episode_end")
+            self.assertEqual(final["camera_stamps"], dict.fromkeys(("cam_h", "cam_l", "cam_r"), 11.0))
+            self.assertNotIn("frames", final)
+            self.assertEqual(audit[-1]["kind"], "closed")
+            self.assertFalse((Path(root) / "diagnostics").exists())
 
     def test_worker_rejects_motion_messages_and_closes_collector(self):
         incoming, outgoing = io.BytesIO(), io.BytesIO()
