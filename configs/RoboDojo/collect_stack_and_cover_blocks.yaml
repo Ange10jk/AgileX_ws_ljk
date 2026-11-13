@@ -3,3 +3,19 @@ extends: ../collect_dual_RoboDojo.yaml
 observation:
   task: Stack the blocks on the table, then cover them with the cup.
   description: There are several blocks and a cup on the table. The robot needs to stack the blocks into a pile and then place the cup over them to cover the stacked blocks.
+  fps: 30
+
+workflow:
+  policy_hz: 30
+
+robot:
+  control_hz: 30
+
+record:
+  queue_size: 16
+  camera_queue_size: 64
+  queue_diagnostics: false
+  # Opt in after checking the ROS Python environment (see docs/configuration.md).
+  camera_in_ros_worker: true
+  camera_queue_policy: strict
+  python: /home/robot/.venvs/piper-ros-realsense/bin/python

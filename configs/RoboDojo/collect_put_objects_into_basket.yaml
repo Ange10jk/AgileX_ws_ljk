@@ -3,3 +3,19 @@ extends: ../collect_dual_RoboDojo.yaml
 observation:
   task: Place all the objects on the table into the basket.
   description: There are multiple objects on the table and a basket nearby. The robot needs to pick up all the objects one by one and place them into the basket.
+  fps: 30
+
+workflow:
+  policy_hz: 30
+
+robot:
+  control_hz: 30
+
+record:
+  queue_size: 16
+  camera_queue_size: 64
+  queue_diagnostics: false
+  # Opt in after checking the ROS Python environment (see docs/configuration.md).
+  camera_in_ros_worker: true
+  camera_queue_policy: strict
+  python: /home/robot/.venvs/piper-ros-realsense/bin/python
