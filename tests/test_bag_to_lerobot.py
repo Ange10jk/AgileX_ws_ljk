@@ -1,12 +1,17 @@
 """Regression checks for bag value semantics and source-time alignment."""
 import copy
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from types import SimpleNamespace
 import unittest
 
 import numpy as np
 
 from piper_control.recording.bag_to_lerobot import (
+    LEADER_FEATURE,
+    LEADER_FRESH_FEATURE,
     MOTOR_KEYS,
     Series,
     build_plan,
@@ -14,9 +19,12 @@ from piper_control.recording.bag_to_lerobot import (
     feature_schema,
     header_ns,
     joint_vector,
+    load_config,
     motor_samples,
     numeric_arrays,
     numeric_frame,
+    read_index,
+    run,
     sample_indices,
     verify_actions,
 )
@@ -76,6 +84,117 @@ def replace_diagnostic_field(status, key, value):
             field.value = json.dumps(value)
             return
     raise AssertionError("Unknown fixture field " + key)
+
+
+class ConversionInputTests(unittest.TestCase):
+    def setUp(self):
+        workdir = TemporaryDirectory()
+        self.addCleanup(workdir.cleanup)
+        self.directory = Path(workdir.name)
+        self.config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    def args(self, *, dual=True, **overrides):
+        name = "lerobot_robodojo_dual.yaml" if dual else "lerobot_insert_plug_v4.yaml"
+        options = dict(config=self.config_dir / name, input=self.directory / "other_task",
+                       output=None, task=None, repo_id=None, inspect=False,
+                       limit=None, recursive=False, report=None)
+        options.update(overrides)
+        return SimpleNamespace(**options)
+
+    def test_dual_conversion_outside_configured_task_requires_all_three_options(self):
+        explicit = {"task": "Stack the bowls.", "output": self.directory / "dataset",
+                    "repo_id": "local/stack_bowls"}
+        for missing in explicit:
+            with self.subTest(missing=missing):
+                overrides = {key: value for key, value in explicit.items() if key != missing}
+                with self.assertRaisesRegex(ValueError, "--task, --output, and --repo-id"):
+                    run(self.args(**overrides))
+        with self.assertRaisesRegex(ValueError, "No [.]bag files"):
+            run(self.args(**explicit))
+
+    def test_dual_inspection_and_right_arm_conversion_allow_input_override(self):
+        for options in (self.args(inspect=True), self.args(dual=False)):
+            with self.subTest(config=options.config):
+                with self.assertRaisesRegex(ValueError, "No [.]bag files"):
+                    run(options)
+
+    def test_dual_input_inside_configured_task_can_use_configured_metadata(self):
+        config = self.directory / "dual.yaml"
+        content = (self.config_dir / "lerobot_robodojo_dual.yaml").read_text()
+        content = content.replace("/home/robot/luojk/datasets/stand_up_bottles", "bottles")
+        content = content.replace("/home/robot/luojk/lerobot_datasets/stand_up_bottles", "dataset")
+        config.write_text(content)
+        with self.assertRaisesRegex(ValueError, "No [.]bag files"):
+            run(self.args(config=config, input=self.directory / "bottles" / "cam_h_low"))
+
+
+class DualArmStreamTests(unittest.TestCase):
+    def setUp(self):
+        config = Path(__file__).resolve().parents[1] / "configs/lerobot_robodojo_dual.yaml"
+        self.cfg = load_config(config)
+        self.cfg["dataset"]["fps"] = 10
+
+    def test_causal_follower_state_and_sparse_leader_commands(self):
+        second = 1_000_000_000
+        tenth = 100_000_000
+        grid_stamps = [second + i * tenth for i in range(5)]
+        series = {key: source_series(grid_stamps) for key in self.cfg["sources"]}
+        series["follower_right"] = source_series(
+            [grid_stamps[0], grid_stamps[1] + tenth // 2, *grid_stamps[2:]])
+        series["leader_left"] = source_series([grid_stamps[1], grid_stamps[4]],
+                                               [np.full(7, 3.), np.full(7, 4.)])
+        series["leader_right"] = source_series([grid_stamps[0]], [np.full(7, 5.)])
+        bounds = {"bag_start_ns": grid_stamps[0], "bag_end_ns": grid_stamps[-1]}
+        grid, selected, _ = build_plan(series, bounds, self.cfg)
+        arrays = numeric_arrays(series, selected, grid=grid, cfg=self.cfg)
+        np.testing.assert_array_equal(grid, grid_stamps)
+        np.testing.assert_allclose(arrays["observation.state"][1, :7], .1)
+        np.testing.assert_array_equal(arrays["observation.state"][1, 7:], 0.)
+        np.testing.assert_array_equal(arrays[LEADER_FEATURE][:, 0], [0, 3, 3, 3, 4])
+        np.testing.assert_array_equal(arrays[LEADER_FEATURE][:, 7], [5, 5, 5, 5, 5])
+        np.testing.assert_array_equal(arrays[LEADER_FRESH_FEATURE],
+                                      [[0, 1], [1, 1], [1, 0], [0, 0], [1, 0]])
+
+    def test_missing_leader_topic_is_rejected(self):
+        expected = [spec["topic"] for spec in self.cfg["sources"].values()]
+        missing = self.cfg["sources"]["leader_right"]["topic"]
+        expected.remove(missing)
+        expected.append(self.cfg["action_metadata_topic"])
+        with patch("rosbags.highlevel.AnyReader") as factory:
+            reader = factory.return_value.__enter__.return_value
+            reader.connections = [SimpleNamespace(topic=topic) for topic in expected]
+            with self.assertRaisesRegex(ValueError, missing):
+                read_index(Path("episode/data.bag"), self.cfg)
+
+    def test_present_but_empty_leader_topic_is_rejected(self):
+        sources = self.cfg["sources"]
+        expected = [spec["topic"] for spec in sources.values()]
+        expected.append(self.cfg["action_metadata_topic"])
+        missing = sources["leader_right"]["topic"]
+        with patch("rosbags.highlevel.AnyReader") as factory:
+            reader = factory.return_value.__enter__.return_value
+            reader.start_time, reader.end_time = 1_000_000_000, 2_000_000_000
+            reader.connections = [SimpleNamespace(topic=topic, msgtype=topic) for topic in expected]
+            reader.messages.return_value = [
+                (conn, reader.start_time, conn.topic) for conn in reader.connections
+                if conn.topic not in (missing, self.cfg["action_metadata_topic"])
+            ]
+            def deserialize(topic, _):
+                key = next(key for key, spec in sources.items() if spec["topic"] == topic)
+                if key.startswith("cam_"):
+                    message = rgb_message(bytes(16))
+                else:
+                    names = self.cfg["joint_names"]
+                    if key.endswith("_left"):
+                        names = names[:7]
+                    elif key.endswith("_right"):
+                        names = names[7:]
+                    message = joint_message(values=np.zeros(len(names)), names=names)
+                message.header = SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=0))
+                return message
+            reader.deserialize.side_effect = deserialize
+            with self.assertRaisesRegex(ValueError, "Required stream has no messages: leader_right"):
+                read_index(Path("episode/data.bag"), self.cfg)
 
 
 class JointVectorTests(unittest.TestCase):

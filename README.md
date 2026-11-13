@@ -139,7 +139,7 @@ python scripts/run.py --config configs/act_dual.yaml --execute
 
 启动会加载模型和相机、使能所选从臂，然后保持姿态。输入 `p` 并回车开始推理，`hold` 暂停，`q` 退出。已准备好任务场景时，可追加 `--auto-start` 自动开始；`--seconds 30` 将启动完成后的整个会话限制为 30 秒。默认回合上限为 120 秒，到时进入保持状态，可通过 `workflow.max_episode_sec` 调整。
 
-训练流程为 **示教数据 → LeRobot 数据集 → 训练 → 配置新 checkpoint**。通用训练模板为 [configs/training/act.yaml](configs/training/act.yaml)。现有 bag 转换器面向右臂、顶部与右腕相机；双臂数据需补充对应转换实现，不能仅更换部署配置完成转换。详见 [数据转换与训练](docs/learning.md)。
+训练流程为 **示教数据 → LeRobot 数据集 → 训练 → 配置新 checkpoint**。通用训练模板为 [configs/training/act.yaml](configs/training/act.yaml)。bag 转换器支持右臂和 RoboDojo 双臂录包。双臂配置分别导出从臂状态、已转发动作、主臂命令及三路 RGB。详见 [数据转换与训练](docs/learning.md)。
 
 ## 4. RLT 人在环强化学习
 

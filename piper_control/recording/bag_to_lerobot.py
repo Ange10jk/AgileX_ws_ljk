@@ -1,4 +1,4 @@
-"""Offline ROS1 -> LeRobot v3 conversion for the right-arm SDK recordings.
+"""Offline ROS1 -> LeRobot v3 conversion for Piper recordings.
 
 Read bags twice: first index source timestamps and small numeric arrays, then
 stream selected RGB frames. Neither ROS nor the hardware SDK is imported.
@@ -22,6 +22,10 @@ import yaml
 LOG = logging.getLogger("bag_to_lerobot")
 NS = 1_000_000_000
 CAMERAS = ("cam_h", "cam_r")
+FOLLOWER_KEYS = ("follower_left", "follower_right")
+LEADER_KEYS = ("leader_left", "leader_right")
+LEADER_FEATURE = "observation.leader_command"
+LEADER_FRESH_FEATURE = "observation.leader_command_fresh"
 MOTOR_KEYS = tuple("motor_%d" % i for i in range(1, 7))
 MOTOR_DIAGNOSTICS_TOPIC = "/piper/arms/right/follower/diagnostics"
 MOTOR_STATUS_NAMES = tuple("right/follower/motor_feedback/%d" % i for i in range(1, 7))
@@ -35,14 +39,14 @@ def header_ns(msg):
     return stamp
 
 
-def joint_vector(msg, names):
+def joint_vector(msg, names, *, dtype=np.float32):
     actual = list(msg.name)
     values = np.asarray(msg.position, dtype=np.float64)
     if (len(actual) != len(set(actual)) or set(actual) != set(names)
             or values.shape != (len(actual),)):
         raise ValueError("Joint names/positions disagree with the configured joint contract: %r" % actual)
-    values = values[[actual.index(name) for name in names]].astype(np.float32)
-    if not np.isfinite(values).all():
+    values = values[[actual.index(name) for name in names]].astype(dtype)
+    if not np.isfinite(values).all() or np.any(np.abs(values) > np.finfo(np.float32).max):
         raise ValueError("Joint positions must be finite float32 values")
     return values
 
@@ -125,6 +129,7 @@ class Series:
     count: int = 0
     reordered: int = 0
     duplicates: int = 0
+    raw: dict = field(default_factory=dict)
 
     def finish(self):
         stamps = np.asarray(self.stamps, dtype=np.int64)
@@ -164,24 +169,51 @@ def sample_indices(stamps, grid, mode="previous"):
     return np.where(abs(stamps[after] - grid) < abs(stamps[before] - grid), after, before)
 
 
-def load_config(path):
+def camera_names(cfg):
+    return ("cam_h", "cam_l", "cam_r") if len(cfg["joint_names"]) == 14 else CAMERAS
+
+
+def image_feature(cam, cfg):
+    if len(cfg["joint_names"]) == 14 and "follower_left" not in cfg.get("sources", {}):
+        cam = {"cam_h": "cam_high", "cam_l": "cam_left_wrist", "cam_r": "cam_right_wrist"}[cam]
+    return "observation.images." + cam
+
+
+def load_config(path, *, task=None, repo_id=None):
     cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(cfg, dict) or cfg.get("schema_version") != 1:
         raise ValueError("Expected schema_version: 1 conversion config")
-    names = ["right_joint_%d" % i for i in range(1, 7)] + ["right_gripper_width"]
-    if cfg.get("joint_names") != names:
-        raise ValueError("This converter requires the canonical seven-component right-arm contract")
-    expected = {"state": "/piper/arms/right/follower/joint_states", "action": "/piper/action",
-                **{cam: "/piper/cameras/%s/color/image_raw" % cam for cam in CAMERAS}}
+    right = ["right_joint_%d" % i for i in range(1, 7)] + ["right_gripper_width"]
+    left = ["left_joint_%d" % i for i in range(1, 7)] + ["left_gripper_width"]
+    names = cfg.get("joint_names")
+    if names not in (right, left + right):
+        raise ValueError("Expected canonical right-arm or left-then-right joint names")
+    dual = len(names) == 14
+    expected = {"state": "/piper/state" if dual else "/piper/arms/right/follower/joint_states",
+                "action": "/piper/action",
+                **{cam: "/piper/cameras/%s/color/image_raw" % cam for cam in camera_names(cfg)}}
+    if dual:
+        expected.update(leader_left="/piper/arms/left/leader/command",
+                        leader_right="/piper/arms/right/leader/command")
+        if "follower_left" in cfg["sources"] or "follower_right" in cfg["sources"]:
+            del expected["state"]
+            expected.update(follower_left="/piper/arms/left/follower/joint_states",
+                            follower_right="/piper/arms/right/follower/joint_states")
     if {key: value["topic"] for key, value in cfg["sources"].items()} != expected:
         raise ValueError("Source mapping must preserve follower feedback / forwarded leader action / RGB semantics")
     if cfg.get("action_metadata_topic") != "/piper/action_metadata":
         raise ValueError("Forwarded actions require /piper/action_metadata")
     if "motor_state" in cfg:
+        if dual:
+            raise ValueError("Dual-arm motor diagnostics are not supported")
         motor = cfg["motor_state"]
         if not isinstance(motor, dict) or motor.get("topic") != MOTOR_DIAGNOSTICS_TOPIC:
             raise ValueError("Motor state requires the right follower diagnostics topic")
     dataset, sync = cfg["dataset"], cfg["sync"]
+    if task is not None:
+        dataset["task"] = task
+    if repo_id is not None:
+        dataset["repo_id"] = repo_id
     if type(dataset["fps"]) is not int or dataset["fps"] < 1:
         raise ValueError("FPS must be a positive integer")
     if not isinstance(dataset["task"], str) or not dataset["task"].strip():
@@ -206,14 +238,16 @@ def check_manifest(bag, cfg):
     manifest = json.loads((bag.parent / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("status") != "complete":
         raise ValueError("Recording manifest is not complete: " + str(bag))
-    if (manifest["selection"]["arms"] != ["right"]
-            or set(manifest["selection"]["cameras"]) != set(CAMERAS)):
-        raise ValueError("Manifest is not right arm + cam_h/cam_r: " + str(bag))
+    arms = ["left", "right"] if len(cfg["joint_names"]) == 14 else ["right"]
+    if (manifest["selection"]["arms"] != arms
+            or set(manifest["selection"]["cameras"]) != set(camera_names(cfg))):
+        raise ValueError("Manifest arm/camera selection disagrees with config: " + str(bag))
     obs = manifest["config"]["observation"]
     if obs.get("action_semantics") != "absolute_joint_position_rad_gripper_m":
         raise ValueError("Manifest has incompatible action units/semantics")
     if obs.get("state_names") != cfg["joint_names"] or obs.get("action_names") != cfg["joint_names"]:
         raise ValueError("Manifest has incompatible state/action component names")
+    return obs.get("task")
 
 
 def verify_actions(action, metadata, names):
@@ -255,6 +289,12 @@ def read_index(bag, cfg):
     topics = {spec["topic"]: key for key, spec in cfg["sources"].items()}
     evidence_topic = cfg["action_metadata_topic"]
     series = {key: Series() for key in cfg["sources"]}
+    names = cfg["joint_names"]
+    stream_names = {"state": names, "action": names}
+    if "leader_left" in series:
+        stream_names.update(leader_left=names[:7], leader_right=names[7:],
+                            follower_left=names[:7], follower_right=names[7:])
+    cameras = camera_names(cfg)
     motor_topic = cfg["motor_state"]["topic"] if "motor_state" in cfg else None
     if motor_topic:
         series.update({key: Series() for key in MOTOR_KEYS})
@@ -298,18 +338,28 @@ def read_index(bag, cfg):
             stamp = header_ns(msg)
             if abs(stamp - bag_stamp) > cfg["sync"]["max_clock_skew_sec"] * NS:
                 raise ValueError("Source/receipt clock discrepancy exceeds limit: " + connection.topic)
-            if key in CAMERAS:
+            if key in cameras:
                 shape = rgb_shape(msg)
                 if source.shape is not None and source.shape != shape:
                     raise ValueError("Camera resolution changed: " + connection.topic)
                 source.shape = shape
             else:
-                source.values.append(joint_vector(msg, cfg["joint_names"]))
+                dtype = np.float64 if key in LEADER_KEYS else np.float32
+                source.values.append(joint_vector(msg, stream_names[key], dtype=dtype))
             source.stamps.append(stamp)
             source.bag_stamps.append(bag_stamp)
             source.ordinals.append(len(source.ordinals))
         bounds = {"bag_start_ns": int(reader.start_time), "bag_end_ns": int(reader.end_time - 1)}
-    for source in series.values():
+    for key, source in series.items():
+        if key in LEADER_KEYS:
+            source.raw = {
+                "source_timestamp_ns": np.asarray(source.stamps, dtype=np.int64),
+                "bag_timestamp_ns": np.asarray(source.bag_stamps, dtype=np.int64),
+                "message_index": np.asarray(source.ordinals, dtype=np.int64),
+                "position": np.asarray(source.values, dtype=np.float64).reshape(-1, 7),
+            }
+        if not source.stamps:
+            raise ValueError("Required stream has no messages: " + key)
         source.finish()
     evidence = verify_actions(series["action"], metadata, cfg["joint_names"])
     return series, bounds, evidence
@@ -319,7 +369,7 @@ def build_plan(series, bounds, cfg):
     fps = cfg["dataset"]["fps"]
     # Keep the original state/action/RGB grid when appending motor observations.
     # Missing or stale motor feedback must fail, not silently move/crop the grid.
-    base = [series[key] for key in cfg["sources"]]
+    base = [series[key] for key in cfg["sources"] if key not in LEADER_KEYS]
     start = max(bounds["bag_start_ns"], *(int(s.stamps[0]) for s in base))
     end = min(bounds["bag_end_ns"], *(int(s.stamps[-1]) for s in base))
     if end < start:
@@ -332,10 +382,22 @@ def build_plan(series, bounds, cfg):
     motors = motor_keys(series)
     for key, source in series.items():
         indices = sample_indices(source.stamps, grid)
+        if key in LEADER_KEYS:
+            selected[key] = indices
+            present = indices >= 0
+            age = grid[present] - source.stamps[indices[present]]
+            summary[key] = {
+                "topic": cfg["sources"][key]["topic"], "messages": source.count,
+                "reordered": source.reordered, "duplicate_stamps": source.duplicates,
+                "frames_without_prior_command": int((~present).sum()),
+                "frames_with_stale_command": int((age > max_age_ns(cfg)).sum()),
+                "max_age_ms": float(age.max() / 1e6) if len(age) else None,
+            }
+            continue
         if (indices < 0).any():
             raise ValueError("No past sample for " + key)
         age = grid - source.stamps[indices]
-        bad = np.flatnonzero(age > round(cfg["sync"]["max_age_sec"] * NS))
+        bad = np.flatnonzero(age > max_age_ns(cfg))
         if len(bad):
             raise ValueError("%s: frame %d sample age %.6fs exceeds limit; refusing to compress a gap" %
                              (key, bad[0], age[bad[0]] / NS))
@@ -352,6 +414,10 @@ def build_plan(series, bounds, cfg):
     return grid, selected, summary
 
 
+def max_age_ns(cfg):
+    return round(cfg["sync"]["max_age_sec"] * NS)
+
+
 def feature_schema(cfg, series):
     if bool(motor_keys(series)) != ("motor_state" in cfg):
         raise ValueError("Motor streams and configured observation state disagree")
@@ -360,29 +426,44 @@ def feature_schema(cfg, series):
         "observation.state": {"dtype": "float32", "shape": (len(observation_names),), "names": observation_names},
         "action": {"dtype": "float32", "shape": (len(cfg["joint_names"]),), "names": cfg["joint_names"]},
     }
-    for cam in CAMERAS:
-        features["observation.images." + cam] = {"dtype": "video", "shape": series[cam].shape,
+    if "leader_left" in series:
+        features[LEADER_FEATURE] = {"dtype": "float32", "shape": (len(cfg["joint_names"]),),
+                                    "names": cfg["joint_names"]}
+        features[LEADER_FRESH_FEATURE] = {"dtype": "float32", "shape": (2,), "names": ["left", "right"]}
+    for cam in camera_names(cfg):
+        features[image_feature(cam, cfg)] = {"dtype": "video", "shape": series[cam].shape,
                                                "names": ["height", "width", "channels"]}
     return features
 
 
-def numeric_frame(series, selected, index):
-    state = series["state"].values[selected["state"][index]]
-    motors = motor_keys(series)
-    if motors:
-        values = np.stack([series[key].values[selected[key][index]] for key in motors])
-        state = np.concatenate((state, values[:, 0], values[:, 1]))
-    return {"observation.state": state,
-            "action": series["action"].values[selected["action"][index]]}
-
-
-def numeric_arrays(series, selected):
-    state = series["state"].values[selected["state"]]
+def numeric_arrays(series, selected, *, grid=None, cfg=None):
+    if "follower_left" in series:
+        state = np.concatenate([series[key].values[selected[key]] for key in FOLLOWER_KEYS], axis=1)
+    else:
+        state = series["state"].values[selected["state"]]
     motors = motor_keys(series)
     if motors:
         values = np.stack([series[key].values[selected[key]] for key in motors], axis=1)
         state = np.concatenate((state, values[:, :, 0], values[:, :, 1]), axis=1)
-    return {"observation.state": state, "action": series["action"].values[selected["action"]]}
+    arrays = {"observation.state": state, "action": series["action"].values[selected["action"]]}
+    if "leader_left" in series:
+        commands = np.zeros((len(grid), 14), dtype=np.float32)
+        fresh = np.zeros((len(grid), 2), dtype=np.float32)
+        for arm, key in enumerate(LEADER_KEYS):
+            ids = selected[key]
+            present = ids >= 0
+            source = series[key]
+            commands[present, arm * 7:(arm + 1) * 7] = source.values[ids[present]]
+            fresh[present, arm] = grid[present] - source.stamps[ids[present]] <= max_age_ns(cfg)
+        arrays[LEADER_FEATURE] = commands
+        arrays[LEADER_FRESH_FEATURE] = fresh
+    return arrays
+
+
+def numeric_frame(series, selected, index, *, grid=None, cfg=None):
+    return {key: value[0] for key, value in numeric_arrays(
+        series, {key: ids[index:index + 1] for key, ids in selected.items()},
+        grid=None if grid is None else grid[index:index + 1], cfg=cfg).items()}
 
 
 def numeric_hash(array):
@@ -392,11 +473,13 @@ def numeric_hash(array):
 def write_episode(dataset, bag, cfg, series, grid, selected):
     from rosbags.highlevel import AnyReader
 
-    wanted = {cam: defaultdict(list) for cam in CAMERAS}
-    for cam in CAMERAS:
+    cameras = camera_names(cfg)
+    wanted = {cam: defaultdict(list) for cam in cameras}
+    for cam in cameras:
         for frame, index in enumerate(selected[cam]):
             wanted[cam][int(series[cam].ordinals[index])].append(frame)
-    topics = {cfg["sources"][cam]["topic"]: cam for cam in CAMERAS}
+    topics = {cfg["sources"][cam]["topic"]: cam for cam in cameras}
+    numeric = numeric_arrays(series, selected, grid=grid, cfg=cfg)
     seen, pending, next_frame = defaultdict(int), {}, 0
     with AnyReader([bag]) as reader:
         connections = [c for c in reader.connections if c.topic in topics]
@@ -408,9 +491,9 @@ def write_episode(dataset, bag, cfg, series, grid, selected):
                 continue
             array = decode_rgb(reader.deserialize(raw, connection.msgtype))
             for frame in frames:
-                pending.setdefault(frame, {})["observation.images." + cam] = array
-            while next_frame in pending and len(pending[next_frame]) == len(CAMERAS):
-                frame = numeric_frame(series, selected, next_frame)
+                pending.setdefault(frame, {})[image_feature(cam, cfg)] = array
+            while next_frame in pending and len(pending[next_frame]) == len(cameras):
+                frame = {key: value[next_frame] for key, value in numeric.items()}
                 frame.update(pending.pop(next_frame))
                 frame["task"] = cfg["dataset"]["task"]
                 dataset.add_frame(frame)
@@ -441,15 +524,15 @@ def validate_dataset(root, cfg, plans):
     for episode, plan in enumerate(plans):
         count = len(plan["grid"])
         rows = dataset.hf_dataset.select(range(offset, offset + count)).with_format("numpy")
-        for key, expected in numeric_arrays(plan["series"], plan["selected"]).items():
+        for key, expected in numeric_arrays(plan["series"], plan["selected"], grid=plan["grid"], cfg=cfg).items():
             np.testing.assert_array_equal(np.asarray(rows[key]), expected)
         np.testing.assert_allclose(np.asarray(rows["timestamp"]).reshape(-1), np.arange(count) / cfg["dataset"]["fps"], atol=1e-5)
         np.testing.assert_array_equal(np.asarray(rows["frame_index"]).reshape(-1), np.arange(count))
         np.testing.assert_array_equal(np.asarray(rows["episode_index"]).reshape(-1), np.full(count, episode))
         for index in (offset, offset + count - 1):
             frame = dataset[index]
-            for cam in CAMERAS:
-                image = frame["observation.images." + cam]
+            for cam in camera_names(cfg):
+                image = frame[image_feature(cam, cfg)]
                 height, width, _ = plan["series"][cam].shape
                 if tuple(image.shape) != (3, height, width) or not np.isfinite(image.numpy()).all():
                     raise ValueError("Invalid decoded video: " + cam)
@@ -461,9 +544,14 @@ def validate_dataset(root, cfg, plans):
 
 def run(args):
     config_path = Path(args.config).expanduser().resolve()
-    cfg = load_config(config_path)
+    cfg = load_config(config_path, task=args.task, repo_id=args.repo_id)
     resolve = lambda value: (config_path.parent / Path(value).expanduser()).resolve()
-    input_dir = Path(args.input).expanduser().resolve() if args.input else resolve(cfg["input_dir"])
+    configured_input = resolve(cfg["input_dir"])
+    input_dir = Path(args.input).expanduser().resolve() if args.input else configured_input
+    outside_task = input_dir != configured_input and configured_input not in input_dir.parents
+    if len(cfg["joint_names"]) == 14 and not args.inspect and outside_task:
+        if not all((args.task, args.output, args.repo_id)):
+            raise ValueError("Dual-arm conversion outside the configured input requires --task, --output, and --repo-id")
     output = Path(args.output).expanduser().resolve() if args.output else resolve(cfg["output_dir"])
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be positive")
@@ -471,9 +559,17 @@ def run(args):
         raise ValueError("Use an explicit --output for a limited preview conversion")
     if not args.inspect and output.exists():
         raise ValueError("Output already exists; refusing to overwrite: " + str(output))
-    if list(input_dir.rglob("*.bag.active")):
+    if input_dir.is_file() and input_dir.suffix == ".bag":
+        bags = [input_dir]
+        active = []
+    elif args.recursive or len(cfg["joint_names"]) == 7:
+        bags = sorted(input_dir.rglob("*.bag"))
+        active = list(input_dir.rglob("*.bag.active"))
+    else:
+        bags = sorted([*input_dir.glob("*.bag"), *input_dir.glob("*/*.bag")])
+        active = [*input_dir.glob("*.bag.active"), *input_dir.glob("*/*.bag.active")]
+    if active:
         raise ValueError("Input contains an actively recorded bag")
-    bags = sorted(input_dir.rglob("*.bag"))
     if args.limit:
         bags = bags[:args.limit]
     if not bags:
@@ -483,10 +579,20 @@ def run(args):
               "timing": "15 Hz by default; causal previous sampling using header stamps and individual motor source stamps; no gap compression",
               "action": "HUMAN forwarded_can_target; absolute joints rad + gripper m",
               "state": {"component_names": state_names(cfg),
-                        "units": ["rad"] * 6 + ["m"] + (["A"] * 6 + ["N*m"] * 6 if "motor_state" in cfg else [])},
+                        "units": (["rad"] * 6 + ["m"]) * (len(cfg["joint_names"]) // 7) + (["A"] * 6 + ["N*m"] * 6 if "motor_state" in cfg else [])},
               "omitted": ["depth", "camera calibration", "other diagnostics" if "motor_state" in cfg else "diagnostics", "empty velocity/effort"],
               "success_labels": "Not inferred from recording completeness",
               "converter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    if "leader_left" in cfg["sources"]:
+        report[LEADER_FEATURE] = {
+            "component_names": cfg["joint_names"], "units": (["rad"] * 6 + ["m"]) * 2,
+            "sources": [cfg["sources"][key]["topic"] for key in LEADER_KEYS],
+            "sampling": "Most recent command at or before each frame per arm; zero placeholder before first command",
+            "freshness_feature": LEADER_FRESH_FEATURE,
+            "freshness_max_age_sec": cfg["sync"]["max_age_sec"],
+            "raw_samples": "meta/source_timestamps/episode_*.npz contains all original samples in bag order; positions are float64",
+            "missing_trace_value": -1,
+        }
     if "motor_state" in cfg:
         report["state"]["motor_feedback"] = {
             "topic": cfg["motor_state"]["topic"], "source": "feedback", "role": "right/follower",
@@ -498,7 +604,7 @@ def run(args):
     for index, bag in enumerate(bags):
         LOG.info("[%d/%d] Inspect %s", index + 1, len(bags), bag.parent.name)
         identity = bag_identity(bag)
-        check_manifest(bag, cfg)
+        manifest_task = check_manifest(bag, cfg)
         try:
             series, bounds, evidence = read_index(bag, cfg)
             grid, selected, summary = build_plan(series, bounds, cfg)
@@ -510,12 +616,18 @@ def run(args):
         schema = features
         if bag_identity(bag) != identity:
             raise ValueError("Bag changed during inspection: " + str(bag))
-        arrays = numeric_arrays(series, selected)
-        item = {"episode_index": index, "source": identity, "frames": len(grid), "sources": summary,
+        arrays = numeric_arrays(series, selected, grid=grid, cfg=cfg)
+        hashes = {"state": numeric_hash(arrays["observation.state"]), "action": numeric_hash(arrays["action"])}
+        if LEADER_FEATURE in arrays:
+            hashes["leader_command"] = numeric_hash(arrays[LEADER_FEATURE])
+            hashes["leader_command_fresh"] = numeric_hash(arrays[LEADER_FRESH_FEATURE])
+        item = {"episode_index": index, "source": identity,
+                "source_manifest_task": manifest_task,
+                "frames": len(grid), "sources": summary,
                 "evidence": evidence, "grid_start_ns": int(grid[0]), "grid_end_ns": int(grid[-1]),
                 "trimmed_start_sec": (int(grid[0]) - bounds["bag_start_ns"]) / NS,
                 "trimmed_end_sec": (bounds["bag_end_ns"] - int(grid[-1])) / NS,
-                "numeric_sha256": {"state": numeric_hash(arrays["observation.state"]), "action": numeric_hash(arrays["action"])}}
+                "numeric_sha256": hashes}
         reports.append(item)
         plans.append(dict(bag=bag, series=series, grid=grid, selected=selected, identity=identity))
     report.update(status="inspected", total_episodes=len(plans), total_frames=sum(len(p["grid"]) for p in plans))
@@ -555,9 +667,17 @@ def run(args):
             arrays = {"grid_timestamp_ns": plan["grid"]}
             for key, source in plan["series"].items():
                 ids = plan["selected"][key]
-                arrays[key + "_source_timestamp_ns"] = source.stamps[ids]
-                arrays[key + "_bag_timestamp_ns"] = source.bag_stamps[ids]
-                arrays[key + "_message_index"] = source.ordinals[ids]
+                for suffix, values in (("source_timestamp_ns", source.stamps),
+                                       ("bag_timestamp_ns", source.bag_stamps),
+                                       ("message_index", source.ordinals)):
+                    if key in LEADER_KEYS:
+                        present = ids >= 0
+                        aligned = np.full(len(ids), -1, dtype=np.int64)
+                        aligned[present] = values[ids[present]]
+                    else:
+                        aligned = values[ids]
+                    arrays[key + "_" + suffix] = aligned
+                arrays.update({key + "_raw_" + suffix: values for suffix, values in source.raw.items()})
             trace = staging / "meta/source_timestamps"
             trace.mkdir(exist_ok=True)
             np.savez_compressed(trace / ("episode_%06d.npz" % index), **arrays)
@@ -586,7 +706,10 @@ def run(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--input", help="Directory searched recursively for complete .bag recordings")
+    parser.add_argument("--input", help="One .bag, one episode directory, or a task/variant directory")
+    parser.add_argument("--recursive", action="store_true", help="Include bags from nested recording variants")
+    parser.add_argument("--task", help="Override the configured task description")
+    parser.add_argument("--repo-id", help="Override the configured LeRobot namespace/dataset name")
     parser.add_argument("--output", help="New output dataset directory; never overwritten")
     parser.add_argument("--inspect", "--dry-run", action="store_true", help="Validate every source and time alignment without writing a dataset")
     parser.add_argument("--report", help="Save inspection/provenance JSON to a new file")

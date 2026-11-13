@@ -21,6 +21,52 @@ ROS 子进程发布 `/piper/state`、各臂状态和 diagnostics、相机 RGB／
 
 ## 通用模型训练
 
+### RoboDojo 双臂 ROS bag 转 LeRobot v3
+
+在 `robot` 的 `~/luojk/AgileX_ws_ljk` 中运行。配置默认读取
+`/home/robot/luojk/datasets/stand_up_bottles`，输出到
+`/home/robot/luojk/lerobot_datasets/stand_up_bottles`。
+
+```bash
+# 验证一个任务的主录制批次，输出检查结果到终端。
+bash scripts/convert_lerobot.sh \
+  --config configs/lerobot_robodojo_dual.yaml \
+  --input /home/robot/luojk/datasets/stack_bowls \
+  --task "Stack the bowls." --repo-id local/stack_bowls --inspect
+
+# 生成该任务的 LeRobot v3 数据集，输出目录须为新目录。
+bash scripts/convert_lerobot.sh \
+  --config configs/lerobot_robodojo_dual.yaml \
+  --input /home/robot/luojk/datasets/stack_bowls \
+  --task "Stack the bowls." --repo-id local/stack_bowls \
+  --output /home/robot/luojk/lerobot_datasets/stack_bowls
+```
+
+`--input` 可指定单个 `.bag`、单个 episode 目录或一个任务批次。相机版本如
+`cam_h_low` 可直接作为 `--input`，并指定独立输出目录。确认各批次图像尺寸和任务
+相同后，可用 `--recursive` 包含嵌套批次。部分任务的录包 manifest 沿用了扶正瓶子的
+任务文本。转换配置默认输入目录之外的数据时，须明确提供 `--task`、`--repo-id`
+和 `--output`，为实际任务设置标签和输出位置。`--inspect` 可直接检查其他目录。
+
+| LeRobot 字段 | ROS 数据源 |
+| --- | --- |
+| `observation.state` | 左、右各自的 `/piper/arms/{left,right}/follower/joint_states` |
+| `action` | `/piper/action` 的已转发位置目标，经 `/piper/action_metadata` 验证 |
+| `observation.leader_command` | 左、右各自的 `/piper/arms/{left,right}/leader/command` |
+| `observation.leader_command_fresh` | 左、右两位 0/1 标记，表示当前帧是否有 150 ms 内的主臂命令 |
+| `observation.images.cam_h` | 顶部相机 RGB |
+| `observation.images.cam_l` / `observation.images.cam_r` | 左、右腕相机 RGB |
+
+三个关节向量均为 14 维，左臂在前，右臂在后。每臂顺序为 J1–J6（rad）、夹爪宽度（m）。
+每个 bag 输出一个 episode。30 Hz 网格以从臂反馈、已验证动作和三路 RGB 的共同时间段为准。
+从臂反馈和主臂命令各自按每条消息的源时间戳逐臂对齐，取当前帧之前最近一条数据。
+主臂命令间隔过长时保留上次观测的命令并标记 freshness=0。每个 bag 须包含两路主臂命令。
+首条主臂命令之前用零占位并标记 freshness=0，时间溯源文件以 -1 标记该臂无历史样本。
+
+`meta/source_timestamps/episode_*.npz` 还按 bag 顺序保存全部主臂命令的 Float64 位置、
+源时间戳、bag 时间戳和消息序号，包含 30 Hz 网格未选中的消息。每个 episode 的统计
+和数值校验结果在 `meta/conversion.json`。相机只导出三路 RGB，深度保存在原始 bag。
+
 ### insert_plug_v4 的 ROS bag 转换
 
 手工录包目录 `bags/insert_plug_v4/data_*/data.bag` 使用独立入口，不需要

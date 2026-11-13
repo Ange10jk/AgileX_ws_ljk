@@ -1,0 +1,52 @@
+schema_version: 1
+input_dir: /home/robot/luojk/datasets/stand_up_bottles
+output_dir: /home/robot/luojk/lerobot_datasets/stand_up_bottles
+dataset:
+  repo_id: local/stand_up_bottles
+  fps: 30
+  task: Stand the bottle upright.
+  robot_type: piper
+joint_names:
+- left_joint_1
+- left_joint_2
+- left_joint_3
+- left_joint_4
+- left_joint_5
+- left_joint_6
+- left_gripper_width
+- right_joint_1
+- right_joint_2
+- right_joint_3
+- right_joint_4
+- right_joint_5
+- right_joint_6
+- right_gripper_width
+sources:
+  follower_left:
+    topic: /piper/arms/left/follower/joint_states
+  follower_right:
+    topic: /piper/arms/right/follower/joint_states
+  action:
+    topic: /piper/action
+  leader_left:
+    topic: /piper/arms/left/leader/command
+  leader_right:
+    topic: /piper/arms/right/leader/command
+  cam_h:
+    topic: /piper/cameras/cam_h/color/image_raw
+  cam_l:
+    topic: /piper/cameras/cam_l/color/image_raw
+  cam_r:
+    topic: /piper/cameras/cam_r/color/image_raw
+action_metadata_topic: /piper/action_metadata
+sync:
+  max_age_sec: 0.15
+  max_clock_skew_sec: 2.0
+  min_frames: 2
+  max_pending_frames: 128
+video:
+  vcodec: h264
+  pix_fmt: yuv420p
+  crf: 18
+  preset: fast
+  g: 30
