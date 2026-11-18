@@ -163,8 +163,8 @@ class TestLCGenHTTP(unittest.TestCase):
                         self.respond(400, {"error": "expected six joint values"})
                         return
                 mode = reply_mode if len(requests) == 1 else "valid"
-                if mode == "http_error":
-                    self.respond(422, {"request_id": "test-422", "error": "rejected"})
+                if reply_mode == "http_error" or (reply_mode == "ik_recovery" and len(requests) <= 3):
+                    self.respond(422, {"request_id": "test-422-%d" % len(requests), "error": "IK failed"})
                     return
                 if mode == "timeout":
                     time.sleep(0.5)
@@ -273,13 +273,32 @@ class TestLCGenHTTP(unittest.TestCase):
         self.assertTrue(model)
         self.assertTrue(all(target[0] == 0.01 for _, target in model))
 
+    def test_mock_ik_retries_reuse_frame_and_continue(self):
+        for request_mode, next_frame in (("v0", 8), ("v1", 25)):
+            with self.subTest(request_mode=request_mode):
+                requests, _, events, *session_info = self.run_mock("ik_recovery", request_mode=request_mode)
+                self.assertEqual(len(requests), 5)
+                self.assertEqual(requests[:4], [requests[0]] * 4)
+                self.assertEqual(requests[4][-1]["wam_frame_index"], next_frame)
+                if session_info:
+                    sessions, resets = session_info
+                    self.assertEqual(sessions, [sessions[0]] * 5)
+                    self.assertEqual(resets, [sessions[0]])
+                self.assertFalse([event for event in events if event["type"] == "policy_error"])
+
     def test_mock_http_failures_hold_without_model_targets(self):
-        for mode, status in (("http_error", "status=422"), ("timeout", "elapsed=")):
+        for mode, status, attempts in (("http_error", "request_id=test-422-4", 4),
+                                       ("timeout", "elapsed=", 1)):
             with self.subTest(mode=mode):
-                _, sent, events = self.run_mock(mode)
+                requests, sent, events = self.run_mock(mode)
+                self.assertEqual(len(requests), attempts)
+                self.assertEqual(requests, [requests[0]] * attempts)
                 self.assertTrue(all(np.all(target == 0.0) for _, target in sent))
                 error = next(event for event in events if event["type"] == "policy_error")
                 self.assertIn(status, error["reason"])
+                if mode == "http_error":
+                    self.assertIn("request_ids=['test-422-1', 'test-422-2', 'test-422-3', 'test-422-4']",
+                                  error["reason"])
                 self.assertTrue(any(event.get("control_state") == Controller.HOLD
                                     and event["type"] == "mode" for event in events))
 

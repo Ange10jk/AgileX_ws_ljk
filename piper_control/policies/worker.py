@@ -7,7 +7,7 @@ import traceback
 from ..ipc import read_message, write_message
 from .adapter import PolicyRunner
 from .interfaces import PolicyError
-from .lcgen_http import LCGenHTTP
+from .lcgen_http import LCGenHTTP, RoboDojoIKError
 
 
 def main():
@@ -50,6 +50,8 @@ def main():
                 response["result"] = getattr(runner.rlt, kind)(**arguments)
             else:
                 raise PolicyError("Unknown worker command %s" % kind)
+        except RoboDojoIKError as exc:
+            response.update(error=str(exc), ik_rejected=True, request_id=exc.request_id)
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
             response["error"] = "%s: %s" % (type(exc).__name__, exc)

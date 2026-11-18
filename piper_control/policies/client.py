@@ -17,6 +17,9 @@ from ..ipc import _owned, read_message, write_message
 from .interfaces import PolicyError, PolicyWorkerError
 
 
+MAX_IK_RETRIES = 3
+
+
 class PolicyClient:
     """Bounded asynchronous subprocess client; never perform inference in control loop.
 
@@ -34,6 +37,7 @@ class PolicyClient:
         self.closed = False
         self.active_since = None
         self.active_seq = None
+        self._active_inference = None
         self.busy = False
         self.command_since = None
         self.command_kind = None
@@ -90,11 +94,23 @@ class PolicyClient:
                     self.busy = False
                     self.command_since = None
                     self.command_kind = None
+                    command, self._active_inference = self._active_inference, None
                     if reply.get("kind") == "infer":
                         self.active_since = None
                         self.active_seq = None
+                    if (self.lcgen_http and reply.get("ik_rejected")
+                            and command is not None and command["generation"] == self.generation):
+                        request_ids = command.setdefault("ik_request_ids", [])
+                        request_ids.append(reply.get("request_id"))
+                        if len(request_ids) <= MAX_IK_RETRIES:
+                            # Each attempt gets its own watchdog deadline.
+                            self.commands.appendleft(command)
+                            reply = None
+                        else:
+                            reply["error"] += " request_ids=%s" % request_ids
                     self.condition.notify_all()
-                self.responses.put(reply)
+                if reply is not None:
+                    self.responses.put(reply)
         except Exception as exc:
             if not self.closed:
                 self.responses.put({"kind": "error", "error": str(exc)})
@@ -115,6 +131,7 @@ class PolicyClient:
                             continue
                         self.active_since = time.monotonic()
                         self.active_seq = command["seq"]
+                        self._active_inference = command
                     self.command_since = time.monotonic()
                     self.command_kind = command["kind"]
                 write_message(self.process.stdin, command)

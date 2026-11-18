@@ -28,6 +28,14 @@ V1_CHUNK_STEPS = 25
 MAX_BODY_BYTES = 16 * 1024 * 1024
 
 
+class RoboDojoIKError(PolicyError):
+    """The predict endpoint rejected the chunk during IK (HTTP 422)."""
+
+    def __init__(self, message, *, request_id=None):
+        super().__init__(message)
+        self.request_id = request_id
+
+
 def _number(value, label):
     if type(value) not in (int, float):
         raise PolicyError("%s must be a finite number" % label)
@@ -218,13 +226,16 @@ class LCGenHTTP:
             request_id = result.get("request_id") or request_id
             if status != 200:
                 message = result.get("error") or result.get("detail") or response.reason
-                raise PolicyError(str(message)[:500])
+                error_type = RoboDojoIKError if path == "/predict" and status == 422 else PolicyError
+                raise error_type(str(message)[:500])
             return result, dict(http_status=status, request_id=request_id,
                                 elapsed_sec=time.monotonic() - started)
         except (OSError, http.client.HTTPException, ValueError, PolicyError) as exc:
-            raise PolicyError("RoboDojo %s %s status=%s elapsed=%.3fs request_id=%s: %s"
-                              % (method, path, status, time.monotonic() - started,
-                                 request_id, exc)) from exc
+            message = ("RoboDojo %s %s status=%s elapsed=%.3fs request_id=%s: %s"
+                       % (method, path, status, time.monotonic() - started, request_id, exc))
+            if isinstance(exc, RoboDojoIKError):
+                raise RoboDojoIKError(message, request_id=request_id) from exc
+            raise PolicyError(message) from exc
         finally:
             connection.close()
 
@@ -321,7 +332,14 @@ class LCGenHTTP:
         body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if len(body) > MAX_BODY_BYTES:
             raise PolicyError("RoboDojo request exceeds the 16 MiB request limit")
-        result, metadata = self._request("POST", "/predict", body)
+        try:
+            result, metadata = self._request("POST", "/predict", body)
+        except RoboDojoIKError:
+            if not v1:
+                # A retry must reuse this frame without duplicating history.
+                self.history.pop()
+                self.history_bytes -= sum(len(img) for img in entry["images"].values())
+            raise
         try:
             actions = parse_actions(result)
             if v1:
