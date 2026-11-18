@@ -154,6 +154,8 @@ def _validate_lcgen_http(robot, policy, obs, flow, record):
     options = policy.get("lcgen_http")
     if not isinstance(options, dict):
         raise ConfigError("policy.lcgen_http must be a mapping")
+    if options.setdefault("request_mode", "v0") not in ("v0", "v1"):
+        raise ConfigError("policy.lcgen_http.request_mode must be v0 or v1")
     try:
         url = urlsplit(options.get("url", ""))
         port = url.port
@@ -184,6 +186,14 @@ def _validate_lcgen_http(robot, policy, obs, flow, record):
     canonical = component_names(robot["arms"])
     if obs["state_names"] != canonical or obs["action_names"] != canonical:
         raise ConfigError("RoboDojo requires canonical left-first component order")
+    task_options = obs.get("task_options", {})
+    if not isinstance(task_options, dict) or any(
+        not isinstance(key, str) or not key.strip()
+        or not isinstance(value, str) or not value.strip()
+        for key, value in task_options.items()
+    ):
+        raise ConfigError("observation.task_options must map nonempty keys to nonempty instructions")
+    obs["task"] = task_options.get(obs["task"], obs["task"])
     if not obs["task"].strip():
         raise ConfigError("RoboDojo requires a nonempty observation.task")
     if obs["camera_map"] != {"observation.images." + camera: camera

@@ -84,6 +84,7 @@ conda activate piper-control
 PIPER_CONFIG="$PWD/configs/robodojo_piper_api.yaml"
 
 sudo -v
+python scripts/recover.py --config "$PIPER_CONFIG" --execute
 python scripts/prepare_can.py --config "$PIPER_CONFIG" --execute
 ```
 ### 方式一：回放lerobot轨迹
@@ -104,7 +105,6 @@ python scripts/robodojo_piper_api_probe.py --config "$PIPER_CONFIG"
 先完成方式一，核对整段预测和现场环境。下列命令用临时配置把本次 SDK 速度设为 10%，并把模型目标限制为一条，会话限时 45 秒。若下次使能仍受电子停止阻止，检查现场后按注释中的命令恢复。
 
 ```bash
-python scripts/recover.py --config "$PIPER_CONFIG" --execute
 
 python scripts/run.py --config "$MOTION_CONFIG" --execute --steps 1 --seconds 45
 
@@ -149,3 +149,8 @@ python scripts/run.py --config "$PIPER_CONFIG" --execute
 ```
 
 瓶子立稳后输入 `s` 回车标记成功并进入 `HOLD`。任务失败输入 `f`，需要暂停输入 `hold`，需要电子停止输入 `stop`。退出时输入 `q` 并等待命令返回。若出现 `policy_error` 并进入 `HOLD`，先检查终端的错误原因、HTTP 状态或请求 ID，确认现场后再输入 `p` 重试。
+
+轨迹回放受收集到rosbag
+```bash
+python scripts/record_replay.py --execute --episode-index 0 --output outputs/replay_bags/episode_0
+```

@@ -3,10 +3,12 @@
 import base64
 import http.client
 import json
+import logging
 import math
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
+from uuid import uuid4
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -22,6 +24,7 @@ CAMERAS = {
     "observation.images.cam_r": "cam_right_wrist",
 }
 GRIPPER_RANGE_M = 0.1
+V1_CHUNK_STEPS = 25
 MAX_BODY_BYTES = 16 * 1024 * 1024
 
 
@@ -182,7 +185,7 @@ def validate_trajectory(actions, measured, capabilities, sdk_limits=None):
 
 
 class LCGenHTTP:
-    """Own the RoboDojo episode history inside the policy subprocess."""
+    """Own the RoboDojo episode history or session inside the policy subprocess."""
 
     mode = "chunk"
     rlt = None
@@ -194,7 +197,11 @@ class LCGenHTTP:
         self.request_timeout = options["request_timeout_sec"]
         self.urdf_path = options["urdf_path"]
         self.names = component_names(cfg["robot"]["arms"])
-        self.invalidate()
+        self.request_mode = options.get("request_mode", "v0")
+        self.session_id = None
+        self.next_frame_index = 0
+        self.history = []
+        self.history_bytes = 0
 
     def _request(self, method, path, body=None):
         # HTTPConnection connects to the configured origin directly, ignoring proxy variables.
@@ -259,18 +266,23 @@ class LCGenHTTP:
         return self
 
     def invalidate(self):
-        self.history = []
+        self.history.clear()
         self.history_bytes = 0
+        self.next_frame_index = 0
+        if self.session_id is not None:
+            body = json.dumps({"session_id": self.session_id}).encode("utf-8")
+            self.session_id = None
+            try:
+                self._request("POST", "/reset", body)
+            except PolicyError as exc:
+                logging.getLogger(__name__).warning("Could not release LCGEN v1 session: %s", exc)
 
     reset = invalidate
 
     def close(self):
         self.invalidate()
 
-    def observe(self, observation):
-        index = len(self.history)
-        if observation["wam_frame_index"] != index:
-            raise PolicyError("Expected RoboDojo episode observation %d" % index)
+    def _encode_observation(self, observation):
         images = {}
         for feature, name in CAMERAS.items():
             rgb = observation[feature]
@@ -279,28 +291,55 @@ class LCGenHTTP:
             if not ok:
                 raise PolicyError("Could not encode RoboDojo camera %s" % name)
             images[name] = base64.b64encode(jpeg).decode("ascii")
-        entry = {"wam_frame_index": index, "env_idx": 0, "wam_fps": 30.0, "images": images}
+        return {"wam_frame_index": observation["wam_frame_index"], "env_idx": 0,
+                "wam_fps": 30.0, "images": images}
+
+    def observe(self, observation):
+        index = len(self.history)
+        if observation["wam_frame_index"] != index:
+            raise PolicyError("Expected RoboDojo episode observation %d" % index)
+        entry = self._encode_observation(observation)
         # Bound memory while accumulating and check the exact serialized size before POST.
-        self.history_bytes += sum(len(img) for img in images.values())
+        self.history_bytes += sum(len(img) for img in entry["images"].values())
         if self.history_bytes > MAX_BODY_BYTES:
             raise PolicyError("RoboDojo observation history exceeds the 16 MiB request limit")
         self.history.append(entry)
         return entry
 
     def infer(self, observation):
-        latest = dict(self.observe(observation), instruction=observation["task"], state={})
+        v1 = self.request_mode == "v1"
+        if v1:
+            if observation["wam_frame_index"] != self.next_frame_index:
+                raise PolicyError("Expected LCGEN v1 observation at frame %d" % self.next_frame_index)
+            entry = self._encode_observation(observation)
+        else:
+            entry = self.observe(observation)
+        latest = dict(entry, instruction=observation["task"], state={})
         for side, part in zip(ARMS, observation["observation.state"].reshape(2, 7)):
             joints = part[:6].tolist()
             latest["state"][side + "_arm_joint_state"] = joints
             latest["state"][side + "_ee_pose"] = self.kinematics.pose(joints)
             latest["state"][side + "_ee_joint_state"] = [float(part[6]) / GRIPPER_RANGE_M]
-        body = json.dumps({"observations": [*self.history[:-1], latest]},
-                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if v1:
+            if self.session_id is None:
+                self.session_id = uuid4().hex
+            payload = {"request_mode": "v1", "session_id": self.session_id,
+                       "observations": [latest]}
+        else:
+            payload = {"observations": [*self.history[:-1], latest]}
+        body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if len(body) > MAX_BODY_BYTES:
-            raise PolicyError("RoboDojo observation history exceeds the 16 MiB request limit")
+            raise PolicyError("RoboDojo request exceeds the 16 MiB request limit")
         result, metadata = self._request("POST", "/predict", body)
         try:
             actions = parse_actions(result)
+            if v1:
+                if result.get("session_id") != self.session_id:
+                    raise PolicyError("LCGEN v1 returned an unexpected session_id")
+                if len(actions) != V1_CHUNK_STEPS:
+                    raise PolicyError("LCGEN v1 must return %d actions" % V1_CHUNK_STEPS)
+                self.next_frame_index += V1_CHUNK_STEPS
+                metadata["session_id"] = self.session_id
         except PolicyError as exc:
             raise PolicyError("RoboDojo POST /predict status=%s elapsed=%.3fs request_id=%s: %s"
                               % (metadata["http_status"], metadata["elapsed_sec"],

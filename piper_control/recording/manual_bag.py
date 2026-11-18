@@ -109,8 +109,8 @@ def _inspect_bag(config, path, env):
     return counts
 
 
-def record_bag(config, output):
-    """Run until Ctrl+C, returning a finalized manifest; no hardware imports."""
+def record_bag(config, output, *, during_recording=None):
+    """Record until Ctrl+C or until the supplied callback returns."""
     directory = Path(output).expanduser().absolute()
     if directory.suffix == ".bag":
         raise ValueError("--output must name a directory, not a .bag file")
@@ -159,16 +159,24 @@ def record_bag(config, output):
                                        start_new_session=True)
             manifest["status"] = "recording"
             _save_manifest(manifest_path, manifest)
-            print("Recording process started -> {}\nCtrl+C stops and saves this bag; teleoperation continues."
-                  .format(bag), flush=True)
+            if during_recording is None:
+                print("Recording process started -> {}\nCtrl+C stops and saves this bag; teleoperation continues."
+                      .format(bag), flush=True)
+            else:
+                print("Recording process started -> {}".format(bag), flush=True)
             try:
-                process.wait()
+                if during_recording is None:
+                    process.wait()
+                    raise RuntimeError("rosbag exited before recording was stopped (exit {})".format(
+                        process.returncode))
+                during_recording(process, bag)
+                if process.poll() is not None:
+                    raise RuntimeError("rosbag exited during replay (exit {})".format(process.returncode))
             except KeyboardInterrupt:
-                print("Saving bag...", flush=True)
-                stopped = True
-                stop_writer(process, directory, float(options.get("shutdown_timeout_sec", 20.0)))
-            if not stopped:
-                raise RuntimeError("rosbag exited before recording was stopped (exit {})".format(process.returncode))
+                pass
+            print("Saving bag...", flush=True)
+            stopped = True
+            stop_writer(process, directory, float(options.get("shutdown_timeout_sec", 20.0)))
             if process.returncode != 0:
                 raise RuntimeError("rosbag exited with code {}".format(process.returncode))
         counts = _inspect_bag(config, bag, env)
@@ -180,7 +188,7 @@ def record_bag(config, output):
             raise RuntimeError("rosbag reported buffer overflow/message loss; inspect rosbag.log")
         manifest.update(status="incomplete" if missing else "complete",
                         reason=("Missing required topics: " + ", ".join(missing))
-                        if missing else "Ctrl+C / recorder stop", exit_code=process.returncode)
+                        if missing else "Recorder stop", exit_code=process.returncode)
     except BaseException as exc:
         if process is not None and not stopped:
             try:

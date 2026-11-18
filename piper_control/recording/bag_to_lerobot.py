@@ -23,6 +23,8 @@ LOG = logging.getLogger("bag_to_lerobot")
 NS = 1_000_000_000
 CAMERAS = ("cam_h", "cam_r")
 FOLLOWER_KEYS = ("follower_left", "follower_right")
+ACTION_PROVENANCE = {"teleop": ("HUMAN", "forwarded_can_target"),
+                     "replay": ("BASE", "sdk_target")}
 LEADER_KEYS = ("leader_left", "leader_right")
 LEADER_FEATURE = "observation.leader_command"
 LEADER_FRESH_FEATURE = "observation.leader_command_fresh"
@@ -192,10 +194,14 @@ def load_config(path, *, task=None, repo_id=None):
     expected = {"state": "/piper/state" if dual else "/piper/arms/right/follower/joint_states",
                 "action": "/piper/action",
                 **{cam: "/piper/cameras/%s/color/image_raw" % cam for cam in camera_names(cfg)}}
-    if dual:
+    provenance = cfg.get("action_provenance", "teleop")
+    if provenance not in ACTION_PROVENANCE or (provenance == "replay" and not dual):
+        raise ValueError("Expected teleop provenance or dual-arm replay provenance")
+    if dual and provenance == "teleop":
         expected.update(leader_left="/piper/arms/left/leader/command",
                         leader_right="/piper/arms/right/leader/command")
-        if "follower_left" in cfg["sources"] or "follower_right" in cfg["sources"]:
+    if dual:
+        if provenance == "replay" or "follower_left" in cfg["sources"] or "follower_right" in cfg["sources"]:
             del expected["state"]
             expected.update(follower_left="/piper/arms/left/follower/joint_states",
                             follower_right="/piper/arms/right/follower/joint_states")
@@ -292,8 +298,9 @@ def read_index(bag, cfg):
     names = cfg["joint_names"]
     stream_names = {"state": names, "action": names}
     if "leader_left" in series:
-        stream_names.update(leader_left=names[:7], leader_right=names[7:],
-                            follower_left=names[:7], follower_right=names[7:])
+        stream_names.update(leader_left=names[:7], leader_right=names[7:])
+    if "follower_left" in series:
+        stream_names.update(follower_left=names[:7], follower_right=names[7:])
     cameras = camera_names(cfg)
     motor_topic = cfg["motor_state"]["topic"] if "motor_state" in cfg else None
     if motor_topic:
@@ -323,8 +330,9 @@ def read_index(bag, cfg):
                 continue
             if connection.topic == evidence_topic:
                 row = json.loads(msg.data)
-                if row.get("source") != "HUMAN" or row.get("action_evidence") != "forwarded_can_target":
-                    raise ValueError("Expected HUMAN / forwarded_can_target action provenance")
+                expected = ACTION_PROVENANCE[cfg.get("action_provenance", "teleop")]
+                if (row.get("source"), row.get("action_evidence")) != expected:
+                    raise ValueError("Expected %s / %s action provenance" % expected)
                 stamp = float(row["timestamp"])
                 if not np.isfinite(stamp) or stamp <= 0:
                     raise ValueError("Invalid action metadata timestamp")
@@ -576,8 +584,9 @@ def run(args):
         raise ValueError("No .bag files under " + str(input_dir))
     plans, reports, schema = [], [], None
     report = {"status": "inspecting", "config": cfg, "output": str(output), "episodes": reports,
-              "timing": "15 Hz by default; causal previous sampling using header stamps and individual motor source stamps; no gap compression",
-              "action": "HUMAN forwarded_can_target; absolute joints rad + gripper m",
+              "timing": f"{cfg['dataset']['fps']} Hz; causal previous sampling using source timestamps; no gap compression",
+              "action": "%s %s; absolute joints rad + gripper m" % ACTION_PROVENANCE[
+                  cfg.get("action_provenance", "teleop")],
               "state": {"component_names": state_names(cfg),
                         "units": (["rad"] * 6 + ["m"]) * (len(cfg["joint_names"]) // 7) + (["A"] * 6 + ["N*m"] * 6 if "motor_state" in cfg else [])},
               "omitted": ["depth", "camera calibration", "other diagnostics" if "motor_state" in cfg else "diagnostics", "empty velocity/effort"],

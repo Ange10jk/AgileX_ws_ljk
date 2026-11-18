@@ -363,7 +363,7 @@ def positive_tolerance(value):
     return tolerance
 
 
-def main(argv=None):
+def main(argv=None, *, config=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episode-index", type=int,
                         help="Zero-based LeRobot episode index (default: shortest episode)")
@@ -383,7 +383,8 @@ def main(argv=None):
     if args.execute and not sys.stdin.isatty():
         parser.error("--execute requires an interactive terminal")
     try:
-        config = load_config(CONFIG)
+        if config is None:
+            config = load_config(CONFIG)
         if config["workflow"]["auto_start"]:
             raise ValueError("Replay requires workflow.auto_start: false")
         episode, actions, measured = load_episode(

@@ -39,6 +39,9 @@ class PolicyClient:
         self.command_kind = None
         self._snapshot_workspace = None
         self.lcgen_http = cfg["policy"].get("backend") == "lcgen_http"
+        self.lcgen_v1 = (
+            self.lcgen_http and cfg["policy"]["lcgen_http"].get("request_mode") == "v1"
+        )
         self.timeout = float(cfg["policy"].get("inference_timeout_sec", 2))
 
     def load(self):
@@ -196,6 +199,13 @@ class PolicyClient:
             self.condition.notify_all()
         try:
             if self.process is not None:
+                if self.lcgen_v1 and self.process.poll() is None:
+                    # EOF lets the worker release its remote episode before exiting.
+                    self.process.stdin.close()
+                    try:
+                        self.process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
                 if self.process.poll() is None:
                     self.process.terminate()
                     try:

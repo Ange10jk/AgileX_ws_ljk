@@ -54,6 +54,7 @@ class Session:
             )
         self.policy = policy
         self._lcgen = config["policy"].get("backend") == "lcgen_http"
+        self._lcgen_v1 = self._lcgen and config["policy"]["lcgen_http"].get("request_mode") == "v1"
         self._lcgen_reply = None
         self._lcgen_observed_step = None
         self._lcgen_sdk_limits = None
@@ -449,7 +450,8 @@ class Session:
                     self.controller.expect(self.seq)
                     self.policy.submit(observation, self.controller.generation, self.seq)
                     return
-                self.policy.observe(observation, self.controller.generation)
+                if not self._lcgen_v1:
+                    self.policy.observe(observation, self.controller.generation)
         except PolicyError as exc:
             self._lcgen_fail(exc, snapshot, frames)
             return

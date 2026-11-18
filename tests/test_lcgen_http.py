@@ -95,12 +95,14 @@ class TestLCGenHTTP(unittest.TestCase):
                 atol=1e-10,
             )
 
-    def run_mock(self, reply_mode, *, resume=False):
+    def run_mock(self, reply_mode, *, resume=False, request_mode="v0"):
         import subprocess
         if subprocess.run([sys.executable, "-s", "-c", "import cv2"],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
             self.skipTest("RoboDojo adapter requires OpenCV in the isolated worker Python")
         requests = []
+        sessions = []
+        resets = []
         metadata = {
             "robot": "piper", "execution_action_type": "joint",
             "executed_raw_action_dim": 14, "runtime_fps": 30.0,
@@ -131,10 +133,17 @@ class TestLCGenHTTP(unittest.TestCase):
                     self.respond(404, {"error": "not found"})
 
             def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path == "/reset":
+                    resets.append(payload["session_id"])
+                    self.respond(200, {})
+                    return
                 if self.path != "/predict":
                     self.respond(404, {"error": "not found"})
                     return
-                observations = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["observations"]
+                observations = payload["observations"]
+                if payload.get("request_mode") == "v1":
+                    sessions.append(payload["session_id"])
                 requests.append(observations)
                 state = observations[-1]["state"]
                 for side in ("left", "right"):
@@ -148,10 +157,16 @@ class TestLCGenHTTP(unittest.TestCase):
                     return
                 if mode == "timeout":
                     time.sleep(0.5)
-                rows = [action(index * 0.005) for index in range(8)]
+                count = 25 if sessions and mode != "short" else 8
+                rows = [action(index * 0.003) for index in range(count)] if sessions else [
+                    action(index * 0.005) for index in range(count)
+                ]
                 if mode == "invalid":
                     rows[-1]["right_arm_joint_state"][5] = 0.5
-                self.respond(200, {"request_id": "test-action", "actions": rows})
+                reply = {"request_id": "test-action", "actions": rows}
+                if sessions:
+                    reply["session_id"] = sessions[-1]
+                self.respond(200, reply)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -162,6 +177,7 @@ class TestLCGenHTTP(unittest.TestCase):
                     "policy": {"python": sys.executable, "inference_timeout_sec": 0.8,
                                "lcgen_http": {"url": "http://127.0.0.1:%d" % server.server_port,
                                                "connect_timeout_sec": 0.15, "request_timeout_sec": 0.25,
+                                               "request_mode": request_mode,
                                                "max_observation_skew_sec": 0.15,
                                                "urdf_path": str(write_test_urdf(Path(directory) / "piper.urdf"))}},
                     "observation": {"width": 160, "height": 120},
@@ -179,12 +195,33 @@ class TestLCGenHTTP(unittest.TestCase):
 
                 session.event = event
                 session.controller.event_sink = event
-                session.run(max_steps=1 if resume else 9, max_seconds=2.5, interactive=False)
+                steps = 26 if request_mode == "v1" else 9
+                session.run(max_steps=1 if resume else steps, max_seconds=2.5, interactive=False)
+                if request_mode == "v1":
+                    return requests, robot.sent, events, sessions, resets
                 return requests, robot.sent, events
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_v1_sends_only_current_frame_and_releases_session(self):
+        requests, sent, events, sessions, resets = self.run_mock("valid", request_mode="v1")
+        self.assertEqual([[obs["wam_frame_index"] for obs in batch] for batch in requests],
+                         [[0], [25]])
+        self.assertEqual(len(set(sessions)), 1)
+        self.assertEqual(resets, [sessions[0]])
+        self.assertFalse([event for event in events if event["type"] == "policy_error"])
+        self.assertEqual(requests[1][0]["state"]["left_arm_joint_state"],
+                         action(24 * 0.003)["left_arm_joint_state"])
+
+    def test_v1_rejects_short_chunks_before_dispatch(self):
+        requests, sent, events, sessions, resets = self.run_mock("short", request_mode="v1")
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(all(np.all(target == 0.0) for _, target in sent))
+        self.assertIn("must return 25 actions",
+                      next(event["reason"] for event in events if event["type"] == "policy_error"))
+        self.assertEqual(resets, [sessions[0]])
 
     def test_mock_history_and_target_timing(self):
         requests, sent, events = self.run_mock("valid")
