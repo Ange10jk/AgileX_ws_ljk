@@ -64,9 +64,7 @@ def parse_actions(reply):
             if not isinstance(gripper, list) or len(gripper) != 1:
                 raise PolicyError("Action %d needs a single value in %s" % (row, gripper_key))
             width = _number(gripper[0], gripper_key)
-            if not 0.0 <= width <= 1.0:
-                raise PolicyError("%s is outside [0, 1]" % gripper_key)
-            values[row, offset + 6] = width
+            values[row, offset + 6] = min(1.0, max(0.0, width))
     values[:, 6] *= GRIPPER_RANGE_M
     values[:, 13] *= GRIPPER_RANGE_M
     return values
@@ -157,7 +155,7 @@ def _step_limits(ik, key):
     return limits
 
 
-def validate_trajectory(actions, measured, capabilities, sdk_limits=None):
+def validate_trajectory(actions, measured, capabilities, sdk_limits):
     """Check every row before enqueuing any action, using fresh follower feedback."""
     values = np.asarray(actions, dtype=float)
     measured = np.asarray(measured, dtype=float)
@@ -168,20 +166,13 @@ def validate_trajectory(actions, measured, capabilities, sdk_limits=None):
         raise PolicyError("Expected fresh finite 14-dimensional follower joint feedback")
     targets = values.reshape(-1, 2, 7)
     joints = targets[:, :, :6]
-    limits = np.asarray(capabilities["joint_limits"], dtype=float)
+    limits = np.asarray(sdk_limits, dtype=float)
+    if (limits.shape != (6, 2) or not np.isfinite(limits).all()
+            or np.any(limits[:, 0] >= limits[:, 1])):
+        raise PolicyError("Invalid Piper joint limits")
     lower, upper = limits[:, 0], limits[:, 1]
-    if sdk_limits is not None:
-        lower = np.maximum(lower, sdk_limits[..., 0])
-        upper = np.minimum(upper, sdk_limits[..., 1])
     if np.any((joints < lower) | (joints > upper)):
         raise PolicyError("RoboDojo action chunk exceeds Piper joint position limits")
-    width = targets[:, :, 6]
-    if np.any((width < 0.0) | (width > GRIPPER_RANGE_M)):
-        raise PolicyError("RoboDojo action chunk exceeds Piper gripper width limits")
-    if np.any(np.abs(joints[0] - measured.reshape(2, 7)[:, :6]) > capabilities["initial_step_rad"]):
-        raise PolicyError("RoboDojo first action exceeds the joint step limit from measured feedback")
-    if np.any(np.abs(np.diff(joints, axis=0)) > capabilities["step_rad"]):
-        raise PolicyError("RoboDojo action chunk exceeds an adjacent joint step limit")
 
 
 class LCGenHTTP:

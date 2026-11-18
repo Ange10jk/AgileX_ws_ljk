@@ -67,7 +67,18 @@ class TestLCGenHTTP(unittest.TestCase):
         np.testing.assert_array_equal(actual[0, :6], [i / 100 for i in range(1, 7)])
         np.testing.assert_array_equal(actual[0, 7:13], [-i / 100 for i in range(1, 7)])
         np.testing.assert_array_equal(actual[:, [6, 13]], [[0.06, 0.1], [0.0, 0.1]])
-        for invalid in ([-0.01], [1.01], [float("nan")], [True], [0.0, 0.5]):
+
+    def test_parse_clips_normalized_gripper_widths_before_converting_to_metres(self):
+        sample = action(0)
+        sample["left_ee_joint_state"] = [-0.01]
+        sample["right_ee_joint_state"] = [1.01]
+        actual = parse_actions({"actions": [sample]})
+        np.testing.assert_array_equal(actual[0, [6, 13]], [0.0, 0.1])
+
+    def test_parse_rejects_invalid_gripper_values(self):
+        sample = action(0)
+        next_sample = action(0.01)
+        for invalid in ([float("nan")], [True], [0.0, 0.5]):
             with self.subTest(invalid=invalid):
                 next_sample["right_ee_joint_state"] = invalid
                 with self.assertRaises(PolicyError):

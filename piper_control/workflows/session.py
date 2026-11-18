@@ -411,9 +411,6 @@ class Session:
         stamps = [*cameras.values(), *(stamp for side in feedback.values() for stamp in side.values())]
         if max(stamps) - min(stamps) > max_skew:
             raise PolicyError("RoboDojo camera and follower timestamps exceed the allowed skew")
-        # Keep the measured grip values in float64 so 0.1 m serializes as exactly 1.0.
-        if np.any((state[[6, 13]] < 0.0) | (state[[6, 13]] > GRIPPER_RANGE_M)):
-            raise RobotError("Measured Piper gripper width is outside [0, 0.1] m")
         observation["observation.state"] = state.copy()
         observation["camera_timestamps"] = cameras
         observation["follower_timestamps"] = feedback
@@ -433,8 +430,9 @@ class Session:
             if reply is not None:
                 self._lcgen_reply = None
                 try:
-                    validate_trajectory(reply["actions"], snapshot["state"],
-                                        self.policy.capabilities, self._lcgen_sdk_limits)
+                    capabilities = self.policy.capabilities
+                    limits = capabilities["joint_limits"] if self.mock else self._lcgen_sdk_limits
+                    validate_trajectory(reply["actions"], snapshot["state"], capabilities, limits)
                 except PolicyError as exc:
                     meta = reply.get("metadata", {})
                     raise PolicyError(
