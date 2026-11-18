@@ -5,6 +5,7 @@ import math
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -89,6 +90,9 @@ def _read(path, seen):
         executable = data.get(section, {}).get("python")
         if executable and ("/" in executable or executable.startswith("~")):
             data[section]["python"] = _path(executable, path.parent)
+    http = data.get("policy", {}).get("lcgen_http", {})
+    if isinstance(http, dict) and "urdf_path" in http:
+        http["urdf_path"] = _path(http["urdf_path"], path.parent)
     rlt = data.get("workflow", {}).get("rlt", {})
     for key in ("prefill_replay", "resume", "output_dir", "snapshot_dir"):
         if key in rlt:
@@ -144,6 +148,47 @@ def _bind_can_adapters(config):
                 raise ConfigError("CAN adapter %s must be a mapping" % name)
             pair[role] = dict(copy.deepcopy(adapters[name]), adapter=name)
     return cfg
+
+
+def _validate_lcgen_http(robot, policy, obs, flow, record):
+    options = policy.get("lcgen_http")
+    if not isinstance(options, dict):
+        raise ConfigError("policy.lcgen_http must be a mapping")
+    try:
+        url = urlsplit(options.get("url", ""))
+        port = url.port
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ConfigError("policy.lcgen_http.url must be an HTTP origin") from exc
+    if (url.scheme != "http" or not url.hostname or url.username is not None
+            or port == 0 or url.path not in ("", "/") or url.query or url.fragment):
+        raise ConfigError("policy.lcgen_http.url must be an HTTP origin")
+    urdf = options.get("urdf_path")
+    if not isinstance(urdf, str) or not urdf.strip():
+        raise ConfigError("policy.lcgen_http.urdf_path must point to the API's Piper URDF")
+    for key, default in (("connect_timeout_sec", 2.0), ("request_timeout_sec", 30.0),
+                         ("max_observation_skew_sec", 0.075)):
+        options.setdefault(key, default)
+        _positive(options[key], "policy.lcgen_http." + key)
+    deadline = options["connect_timeout_sec"] + options["request_timeout_sec"]
+    if policy["inference_timeout_sec"] <= deadline:
+        raise ConfigError("policy.inference_timeout_sec must exceed both HTTP timeouts combined")
+    if robot["arms"] != ["left", "right"] or any(
+        robot["pairs"][side].get("leader") is not None for side in robot["arms"]
+    ):
+        raise ConfigError("RoboDojo requires the left and right followers only")
+    if (flow["mode"] != "deploy" or flow["auto_start"]
+            or record["backend"] != "none" or policy["execution"] != "chunk"):
+        raise ConfigError("RoboDojo requires manual-start chunk deployment with record.backend=none")
+    if obs["fps"] != 30 or flow["policy_hz"] != 30:
+        raise ConfigError("RoboDojo requires 30 Hz observations and policy ticks")
+    canonical = component_names(robot["arms"])
+    if obs["state_names"] != canonical or obs["action_names"] != canonical:
+        raise ConfigError("RoboDojo requires canonical left-first component order")
+    if not obs["task"].strip():
+        raise ConfigError("RoboDojo requires a nonempty observation.task")
+    if obs["camera_map"] != {"observation.images." + camera: camera
+                              for camera in ("cam_h", "cam_l", "cam_r")}:
+        raise ConfigError("RoboDojo requires cam_h, cam_l, and cam_r RGB cameras")
 
 
 def validate_config(config):
@@ -233,10 +278,10 @@ def validate_config(config):
         or policy_type == "auto"
     ):
         raise ConfigError(
-            "policy.type is required and must explicitly select a registered LeRobot model"
+            "policy.type must explicitly identify the policy"
         )
-    if policy.get("backend", "lerobot") not in ("lerobot", "mock"):
-        raise ConfigError("policy.backend must be lerobot or mock")
+    if policy.get("backend", "lerobot") not in ("lerobot", "mock", "lcgen_http"):
+        raise ConfigError("policy.backend must be lerobot, mock, or lcgen_http")
     policy.setdefault("backend", "lerobot")
     policy.setdefault("execution", "auto")
     if policy["execution"] not in ("auto", "step", "chunk"):
@@ -354,6 +399,8 @@ def validate_config(config):
     record.setdefault("backend", "none")
     if record["backend"] not in ("none", "files", "ros", "ros_publish"):
         raise ConfigError("record.backend must be none, files, ros, or ros_publish")
+    if policy["backend"] == "lcgen_http":
+        _validate_lcgen_http(robot, policy, obs, flow, record)
     if flow["mode"] == "online_rl" and record["backend"] == "ros_publish":
         raise ConfigError("online_rl requires stored trajectories; ros_publish only publishes topics")
     record.setdefault("python", "/usr/bin/python3")

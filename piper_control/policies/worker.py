@@ -7,6 +7,7 @@ import traceback
 from ..ipc import read_message, write_message
 from .adapter import PolicyRunner
 from .interfaces import PolicyError
+from .lcgen_http import LCGenHTTP
 
 
 def main():
@@ -21,20 +22,25 @@ def main():
             break
         kind = message["kind"]
         response = {"kind": kind}
-        if kind == "infer":
-            response.update(generation=message["generation"], seq=message["seq"])
+        if kind in ("infer", "observe"):
+            response.update(generation=message["generation"], seq=message.get("seq"))
         try:
             if kind == "load":
-                runner = PolicyRunner(message["config"]).load()
+                config = message["config"]
+                backend = LCGenHTTP if config["policy"].get("backend") == "lcgen_http" else PolicyRunner
+                runner = backend(config).load()
                 response = {"kind": "ready", "execution": runner.mode,
                             "action_names": runner.names,
                             "rlt_horizon": runner.rlt.horizon if runner.rlt else None,
                             "episode_id": runner.rlt.episode_id if runner.rlt else 0,
                             "model_contract_sha256": getattr(runner, "contract_sha256", None)}
+                response.update(getattr(runner, "capabilities", {}))
             elif runner is None:
                 raise PolicyError("Worker is not loaded")
             elif kind == "infer":
                 response.update(runner.infer(message["observation"]))
+            elif kind == "observe":
+                runner.observe(message["observation"])
             elif kind == "reset":
                 runner.invalidate()
             elif kind in ("record_step", "boundary", "end_episode", "update", "save"):

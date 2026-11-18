@@ -1,0 +1,30 @@
+extends: base_RoboDojo.yaml
+
+robot:
+  move_speed_percent: 100  # 10% 的 SDK 速度
+
+policy:
+  backend: lcgen_http
+  type: lcgen_http
+  python: /usr/bin/python3
+  checkpoint: null
+  execution: chunk
+  startup_timeout_sec: 12
+  inference_timeout_sec: 35
+  lcgen_http:
+    url: http://100.113.96.55:8089
+    connect_timeout_sec: 2
+    request_timeout_sec: 30
+    # Copy the exact Piper URDF from the API host before starting.
+    urdf_path: ../third_party/piper_description.urdf
+    max_observation_skew_sec: 0.075
+
+observation:
+  fps: 30
+  # Set task to the instruction for the current episode.
+  task: Stand the bottle upright.
+  description: There is a bottle lying on the table. The robot needs to pick it up and place it upright on the table.
+
+workflow:
+  policy_hz: 30
+  

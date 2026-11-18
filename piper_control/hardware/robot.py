@@ -41,26 +41,28 @@ class SDKRobot:
             self.config["pairs"][side].get("leader") is not None for side in self.arms
         )
 
+    def _sdk_config(self, channel):
+        from pyAgxArm import create_agx_arm_config, resolve_firmware_profile
+
+        return create_agx_arm_config(
+            robot="piper",
+            firmeware_version=resolve_firmware_profile("piper", self.config["firmware"]),
+            interface="socketcan",
+            channel=channel,
+            bitrate=self.config.get("bitrate", 1000000),
+        )
+
+    def joint_limits(self):
+        """Read the SDK preset used by this firmware without opening a CAN socket."""
+        limits = self._sdk_config("can0")["joint_limits"]
+        return np.asarray([limits["joint%d" % i] for i in range(1, 7)], dtype=float)
+
     def _make_sdk(self, spec):
         if self.sdk_factory is not None:
             return self.sdk_factory(spec, self.config)
-        from pyAgxArm import (
-            AgxArmFactory,
-            create_agx_arm_config,
-            resolve_firmware_profile,
-        )
+        from pyAgxArm import AgxArmFactory
 
-        sdk = AgxArmFactory.create_arm(
-            create_agx_arm_config(
-                robot="piper",
-                firmeware_version=resolve_firmware_profile(
-                    "piper", self.config["firmware"]
-                ),
-                interface="socketcan",
-                channel=spec["channel"],
-                bitrate=self.config.get("bitrate", 1000000),
-            )
-        )
+        sdk = AgxArmFactory.create_arm(self._sdk_config(spec["channel"]))
         return sdk, sdk.init_effector(sdk.OPTIONS.EFFECTOR.AGX_GRIPPER)
 
     def connect(self):
@@ -729,6 +731,8 @@ class MockRobot:
                 monotonic=mono,
                 valid=True,
                 source="feedback",
+                joint_timestamp=stamp,
+                gripper_timestamp=stamp,
             )
             pairs[side] = dict(follower=sample)
             if self.config["pairs"][side].get("leader") is not None:

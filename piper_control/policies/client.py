@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from ..ipc import _owned, read_message, write_message
-from .interfaces import PolicyError
+from .interfaces import PolicyError, PolicyWorkerError
 
 
 class PolicyClient:
@@ -38,6 +38,7 @@ class PolicyClient:
         self.command_since = None
         self.command_kind = None
         self._snapshot_workspace = None
+        self.lcgen_http = cfg["policy"].get("backend") == "lcgen_http"
         self.timeout = float(cfg["policy"].get("inference_timeout_sec", 2))
 
     def load(self):
@@ -80,6 +81,9 @@ class PolicyClient:
             while not self.closed:
                 reply = read_message(self.process.stdout)
                 with self.condition:
+                    if (self.lcgen_http and self.command_since is not None
+                            and time.monotonic() - self.command_since > self.timeout):
+                        reply = {"kind": "error", "error": "RoboDojo worker exceeded watchdog deadline"}
                     self.busy = False
                     self.command_since = None
                     self.command_kind = None
@@ -130,29 +134,37 @@ class PolicyClient:
             self.commands = collections.deque(m for m in self.commands if m["kind"] != "infer")
             self._enqueue({"kind": "infer", "observation": observation, "generation": generation, "seq": seq})
 
+    def observe(self, observation, generation):
+        self._enqueue({"kind": "observe", "observation": observation, "generation": generation})
+
     def poll(self):
         with self.condition:
             timeout = (float(self.cfg["policy"].get("update_timeout_sec",
                        self.cfg.get("workflow", {}).get("rlt", {}).get("update_timeout_sec", 600)))
                        if self.command_kind in ("end_episode", "update", "save") else self.timeout)
             if self.command_since is not None and time.monotonic() - self.command_since > timeout:
-                raise PolicyError("Policy worker %s timed out (seq=%s); invalidate control and restart worker" %
-                                  (self.command_kind, self.active_seq))
+                error_type = PolicyWorkerError if self.lcgen_http else PolicyError
+                raise error_type("Policy worker %s timed out (seq=%s); invalidate control and restart worker" %
+                                 (self.command_kind, self.active_seq))
         while True:
             try:
                 reply = self.responses.get_nowait()
             except queue.Empty:
                 return None
-            if reply.get("error"):
-                raise PolicyError(reply["error"])
-            if reply.get("kind") == "infer" and reply.get("generation") != self.generation:
+            kind = reply.get("kind")
+            stale = (kind in ("infer", "observe") and reply.get("generation") != self.generation)
+            if reply.get("error") and not (self.lcgen_http and stale):
+                error_type = PolicyWorkerError if self.lcgen_http and kind == "error" else PolicyError
+                raise error_type(reply["error"])
+            if stale or kind == "observe":
                 continue
             return reply
 
     def invalidate(self, generation):
         with self.condition:
             self.generation = generation
-            self.commands = collections.deque(m for m in self.commands if m["kind"] != "infer")
+            self.commands = collections.deque(
+                m for m in self.commands if m["kind"] not in ("infer", "observe"))
             self._enqueue({"kind": "reset", "generation": generation})
 
     def reset(self):

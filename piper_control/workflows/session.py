@@ -8,13 +8,17 @@ import sys
 import threading
 import time
 
+import numpy as np
+
 from ..hardware.cameras import CameraRig, MockCameras
 from ..control.arbiter import Controller, ControlError
 from ..config import component_names
 from ..observation import make_observation
 from ..policies.client import PolicyClient
+from ..policies.interfaces import PolicyError, PolicyWorkerError
+from ..policies.lcgen_http import GRIPPER_RANGE_M, validate_trajectory
 from ..recording.session import RecordingSession
-from ..hardware.robot import SDKRobot, MockRobot
+from ..hardware.robot import SDKRobot, MockRobot, RobotError
 from .definitions import get_workflow
 
 
@@ -49,6 +53,10 @@ class Session:
                 config["observation"]
             )
         self.policy = policy
+        self._lcgen = config["policy"].get("backend") == "lcgen_http"
+        self._lcgen_reply = None
+        self._lcgen_observed_step = None
+        self._lcgen_sdk_limits = None
         self.recording = recording or RecordingSession(config)
         self.controller = Controller(config, self.robot, self.event)
         self.commands = queue.Queue()
@@ -88,7 +96,7 @@ class Session:
             }
             state = event["control_state"]
             print("[控制] {}：{}".format(state, descriptions.get(state, state)), flush=True)
-        elif kind in ("command_rejected", "fault"):
+        elif kind in ("command_rejected", "fault", "policy_error"):
             print("[控制] {}：{}".format(kind, event.get("reason", "")), flush=True)
 
     def _log(self, kind, **fields):
@@ -112,8 +120,13 @@ class Session:
                 options.setdefault(
                     "output_dir", str(self.recording.directory / "training")
                 )
-            self.policy = self.policy or PolicyClient(self.cfg)
-            self.policy.load()
+            self._load_policy()
+            if self._lcgen and not self.mock:
+                self._lcgen_sdk_limits = self.robot.joint_limits()
+                if (self._lcgen_sdk_limits.shape != (6, 2)
+                        or not np.isfinite(self._lcgen_sdk_limits).all()
+                        or np.any(self._lcgen_sdk_limits[:, 0] >= self._lcgen_sdk_limits[:, 1])):
+                    raise RobotError("Invalid Piper SDK joint limits")
             capabilities = getattr(self.policy, "capabilities", {})
             self.episode_id = int(capabilities.get("episode_id", 0))
         self.robot.connect()
@@ -151,6 +164,10 @@ class Session:
         )
         return self
 
+    def _load_policy(self):
+        self.policy = self.policy or PolicyClient(self.cfg)
+        self.policy.load()
+
     def _camera_snapshot(self):
         return self.cameras.snapshot() if self.cameras is not None else {}
 
@@ -160,17 +177,19 @@ class Session:
         )
 
     def _invalidate_policy(self):
+        self._lcgen_reply = None
+        self._lcgen_observed_step = None
         if self.policy:
             self.policy.invalidate(self.controller.generation)
         self.needs_boundary = True
 
     def _finish_step(
-        self, snapshot, frames, terminal=False, truncated=False, reward=0.0
+        self, snapshot, frames, terminal=False, truncated=False, reward=0.0, observation=None
     ):
         if self.pending is None:
             return
         step = dict(self.pending)
-        next_obs = self._observation(snapshot, frames)
+        next_obs = observation if observation is not None else self._observation(snapshot, frames)
         step["next_observation"] = _stored_observation(snapshot, frames)
         step["duration_sec"] = max(0.0, time.monotonic() - step.pop("_started"))
         before_obs = step.pop("_policy_observation")
@@ -241,6 +260,13 @@ class Session:
                     reason="this manual workflow has no policy",
                 )
                 return
+            if self._lcgen and self.policy is None:
+                try:
+                    self._load_policy()
+                except (OSError, PolicyError) as exc:
+                    self._close_policy()
+                    self._log("policy_error", reason=str(exc))
+                    return
             self._finish_step(snapshot, frames)
             if command in ("p", "policy"):
                 self.controller.enter_policy()
@@ -249,6 +275,9 @@ class Session:
             self._invalidate_policy()
             self._begin_episode()
         elif command in ("hold", "pause", " "):
+            if self._lcgen and self.episode_active:
+                self.end_episode(snapshot, frames, False, True, 0.0, False)
+                return
             self._finish_step(snapshot, frames)
             self.controller.pause()
             self._invalidate_policy()
@@ -274,9 +303,10 @@ class Session:
             self._log("command_rejected", command=command, reason="unknown command")
 
     def end_episode(self, snapshot, frames, terminal, truncated, reward, success):
-        final_obs = self._observation(snapshot, frames)
+        final_obs = {} if self._lcgen else self._observation(snapshot, frames)
         self._finish_step(
-            snapshot, frames, terminal=terminal, truncated=truncated, reward=reward
+            snapshot, frames, terminal=terminal, truncated=truncated, reward=reward,
+            observation=final_obs if self._lcgen else None,
         )
         self.controller.pause()
         self._invalidate_policy()
@@ -305,24 +335,142 @@ class Session:
             self.episode_id += 1
         self.step_id = 0
 
-    def _poll(self):
+    def _close_policy(self):
+        policy, self.policy = self.policy, None
+        if policy is not None:
+            policy.close()
+
+    def _lcgen_fail(self, exc, snapshot, frames):
+        restart = isinstance(exc, PolicyWorkerError)
+        if restart:
+            # Prevent invalidation from enqueueing onto the broken worker.
+            worker, self.policy = self.policy, None
+        if self.episode_active:
+            self.end_episode(snapshot, frames, False, True, 0.0, False)
+        self._log("policy_error", reason=str(exc))
+        if restart:
+            if worker is not None:
+                worker.close()
+            try:
+                self._load_policy()
+            except (OSError, PolicyError) as load_error:
+                self._close_policy()
+                self._log("policy_error", reason="Worker restart failed: %s" % load_error)
+
+    def _poll(self, snapshot=None, frames=None):
         if not self.policy:
             return
         while True:
-            reply = self.policy.poll()
+            try:
+                reply = self.policy.poll()
+            except PolicyError as exc:
+                if not self._lcgen:
+                    raise
+                self._lcgen_fail(exc, snapshot, frames)
+                return
             if reply is None:
                 return
             if reply.get("kind", "infer") == "infer":
-                self.controller.offer(reply)
+                if not self._lcgen:
+                    self.controller.offer(reply)
+                elif (self.controller.state == Controller.POLICY
+                      and reply.get("generation") == self.controller.generation
+                      and self.controller.pending_seq is not None
+                      and reply.get("seq") == self.controller.pending_seq):
+                    self._lcgen_reply = reply
             elif reply.get("kind") == "end_episode":
                 self._log("learner_result", result=reply.get("result"))
                 self.learning_pending = False
                 self.episode_id += 1
 
+    def _lcgen_observation(self, snapshot, frames):
+        max_skew = self.cfg["policy"]["lcgen_http"]["max_observation_skew_sec"]
+        now = time.time()
+        feedback = {}
+        for side in self.cfg["robot"]["arms"]:
+            follower = snapshot.get("arms", {}).get(side, {}).get("follower", {})
+            stamps = {name: follower.get(name) for name in ("joint_timestamp", "gripper_timestamp")}
+            if not follower.get("valid") or not all(
+                stamp is not None and math.isfinite(stamp) and abs(now - stamp) <= max_skew
+                for stamp in stamps.values()
+            ):
+                raise RobotError("Stale or unavailable follower feedback: " + side)
+            feedback[side] = stamps
+        state = np.asarray(snapshot["state"], dtype=float)
+        if state.shape != (14,) or not np.isfinite(state).all():
+            raise RobotError("Invalid measured 14D follower state")
+        try:
+            observation = self._observation(snapshot, frames)
+        except ValueError as exc:
+            raise PolicyError(str(exc)) from exc
+        cameras = {name: frames[name].get("stamp") for name in self.cfg["observation"]["camera_map"].values()}
+        if not all(stamp is not None and math.isfinite(stamp) and abs(now - stamp) <= max_skew
+                   for stamp in cameras.values()):
+            raise PolicyError("Stale or unavailable RoboDojo camera frames")
+        stamps = [*cameras.values(), *(stamp for side in feedback.values() for stamp in side.values())]
+        if max(stamps) - min(stamps) > max_skew:
+            raise PolicyError("RoboDojo camera and follower timestamps exceed the allowed skew")
+        # Keep the measured grip values in float64 so 0.1 m serializes as exactly 1.0.
+        if np.any((state[[6, 13]] < 0.0) | (state[[6, 13]] > GRIPPER_RANGE_M)):
+            raise RobotError("Measured Piper gripper width is outside [0, 0.1] m")
+        observation["observation.state"] = state.copy()
+        observation["camera_timestamps"] = cameras
+        observation["follower_timestamps"] = feedback
+        return observation
+
+    def _lcgen_tick(self, snapshot, frames):
+        if self.controller.state != Controller.POLICY:
+            return
+        reply = self._lcgen_reply
+        if reply is None and self.controller.pending_seq is not None:
+            return
+        try:
+            observation = self._lcgen_observation(snapshot, frames)
+            self._finish_step(snapshot, frames, observation=observation)
+            self.last_observation = observation
+            observation["wam_frame_index"] = self.step_id
+            if reply is not None:
+                self._lcgen_reply = None
+                try:
+                    validate_trajectory(reply["actions"], snapshot["state"],
+                                        self.policy.capabilities, self._lcgen_sdk_limits)
+                except PolicyError as exc:
+                    meta = reply.get("metadata", {})
+                    raise PolicyError(
+                        "RoboDojo action chunk rejected status=%s elapsed=%s request_id=%s: %s"
+                        % (meta.get("http_status"), meta.get("elapsed_sec"),
+                           meta.get("request_id"), exc)
+                    ) from exc
+                self.controller.offer(reply)
+            if self._lcgen_observed_step != self.step_id:
+                self._lcgen_observed_step = self.step_id
+                if not self.controller.actions:
+                    self.seq += 1
+                    self.controller.expect(self.seq)
+                    self.policy.submit(observation, self.controller.generation, self.seq)
+                    return
+                self.policy.observe(observation, self.controller.generation)
+        except PolicyError as exc:
+            self._lcgen_fail(exc, snapshot, frames)
+            return
+        self._dispatch(snapshot, frames, observation)
+
     def _policy_tick(self, snapshot, frames):
+        if self._lcgen:
+            self._lcgen_tick(snapshot, frames)
+            return
         self._finish_step(snapshot, frames)
         observation = self._observation(snapshot, frames)
         self.last_observation = observation
+        self._dispatch(snapshot, frames, observation)
+        # Refill after retaining the command that was actually sent.
+        if self.controller.state == Controller.POLICY:
+            if not self.controller.actions and self.controller.pending_seq is None:
+                self.seq += 1
+                self.controller.expect(self.seq)
+                self.policy.submit(observation, self.controller.generation, self.seq)
+
+    def _dispatch(self, snapshot, frames, observation):
         step = self.controller.step(snapshot)
         if step is not None:
             metadata = step.get("metadata", {})
@@ -370,15 +518,6 @@ class Session:
                     human_action_stamp=snapshot.get("human_action_stamp"),
                 )
                 print("[采集] 已收到主臂动作，人工 action 数据已就绪。", flush=True)
-        # Consume this tick's action before deciding whether to refill. A
-        # single-action policy can then compute during the interval until the
-        # next tick instead of inserting an unavoidable hold every other tick.
-        # Retain the executed step first so an enqueue failure cannot erase it.
-        if self.controller.state == Controller.POLICY:
-            if not self.controller.actions and self.controller.pending_seq is None:
-                self.seq += 1
-                self.controller.expect(self.seq)
-                self.policy.submit(observation, self.controller.generation, self.seq)
 
     def _input(self):
         # Line-oriented input also supports pipes and scripted demonstrations.
@@ -462,8 +601,11 @@ class Session:
                 self.recording.check_health()
                 if self.cameras is not None:
                     self.cameras.check_health()
-                self._poll()
+                if not self._lcgen:
+                    self._poll()
                 snapshot, frames = self.robot.snapshot(), self._camera_snapshot()
+                if self._lcgen:
+                    self._poll(snapshot, frames)
                 self.recording.publish_state(snapshot)
                 if self.cameras is not None and not self._camera_recording:
                     self.recording.publish_images(frames)
@@ -516,7 +658,11 @@ class Session:
                     self._policy_tick(snapshot, frames)
                     if not collect_on_control_tick:
                         next_policy = now + 1.0 / policy_hz
-                next_control += control_period
+                if self._lcgen:
+                    if now >= next_control:
+                        next_control = now + control_period
+                else:
+                    next_control += control_period
                 if collect_on_control_tick:
                     remaining = next_control - time.monotonic()
                     if remaining < 0:
@@ -525,7 +671,10 @@ class Session:
                         next_control += skipped * control_period
                     time.sleep(max(0.0, next_control - time.monotonic()))
                 else:
-                    time.sleep(max(0.0, min(next_control - time.monotonic(), 0.05)))
+                    wakeup = next_control
+                    if self._lcgen and self.episode_active:
+                        wakeup = min(wakeup, next_policy)
+                    time.sleep(max(0.0, min(wakeup - time.monotonic(), 0.05)))
                     if next_control < time.monotonic() - 0.1:
                         next_control = time.monotonic()
             self._log("session_end", steps=self.total_steps)

@@ -97,6 +97,15 @@ robot:
 
 模型输入校验同时检查状态、动作、相机名称及可选的 checkpoint `deployment.json`。有额外传感器输入却没有硬件映射的模型会报错。预处理、后处理、归一化和内部填充沿用保存的处理器。
 
+### RoboDojo Piper HTTP
+
+[robodojo_piper_api.yaml](../configs/robodojo_piper_api.yaml) 使用机器人上的系统 Python 启动 HTTP 策略子进程。该解释器需要 NumPy、PyYAML 和 OpenCV。将 API 的 `/health` 报告的 `metadata.ik.urdf_path` 文件复制到配置中的 `policy.lcgen_http.urdf_path`，并将 `observation.task` 设为本回合的指令。启动会检查服务的 Piper 关节契约并加载 URDF，再连接和使能从臂。
+
+按 `p` 开始回合。策略以 30 Hz 提交分段目标，等待下一段推理时保持最后的姿态。请求发送本回合的观测历史，达到 16 MiB 上限、请求失败或动作校验失败时切到 HOLD。确认原因后按 `p` 从第 0 帧重新开始。
+
+离线验收可运行 `/usr/bin/python3 -m unittest tests.test_lcgen_http -v`，通过本地 mock API 和模拟从臂验证请求历史、目标时序和失败路径。
+
+
 ## 工作流与采集彼此独立
 
 `deploy` 加载模型，主臂可选；`teleop` 和 `collect` 只进行 SDK 主从控制，要求所选侧都设置 `leader: true`；`online_rl` 加载模型和 learner，示例默认带主臂，也允许设置 `leader: false` 做无人工介入的在线学习。`p/h/hold` 管理控制权，其中 `h` 要求所选侧的主臂都存在；缺少主臂时拒绝接管请求并继续模型运行。`s/f/t` 管理回合，不通过 ROS 消息改变机械臂状态。

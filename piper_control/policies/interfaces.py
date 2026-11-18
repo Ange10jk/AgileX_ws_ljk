@@ -15,6 +15,10 @@ class PolicyError(RuntimeError):
     """A model contract, dependency, transport or inference failure."""
 
 
+class PolicyWorkerError(PolicyError):
+    """The local worker must be reaped before the next policy episode."""
+
+
 Observation = Dict[str, Any]
 
 

@@ -71,3 +71,81 @@ python scripts/record.py --config "$PIPER_CONFIG" --output ~/luojk/datasets/stan
 
 
 参考：本仓库 `README.md`、上述 YAML、`piper_control/cli.py`、`piper_control/workflows/session.py`、`piper_control/recording/manual_bag.py`、`piper_control/recording/topics.py`；任务名称参考 [RoboDojo 真实任务目录](https://robodojo-benchmark.com/doc/real-tasks/) 与 [官方项目](https://github.com/RoboDojo-Benchmark/RoboDojo)。
+
+# 第二阶段：RoboDojo Piper API 双臂部署与终端联调
+
+在 robot 的交互式终端执行。退出占用相机或 CAN 的采集和控制进程，确认左右从臂和三台相机已通电。两种方式共用 [RoboDojo 部署配置](configs/robodojo_piper_api.yaml)，当前任务为 `Stand the bottle upright.`。
+
+### 双臂部署准备
+
+```bash
+cd ~/luojk/AgileX_ws_ljk
+conda activate piper-control
+PIPER_CONFIG="$PWD/configs/robodojo_piper_api.yaml"
+
+sudo -v
+python scripts/prepare_can.py --config "$PIPER_CONFIG" --execute
+```
+### 方式一：回放lerobot轨迹
+```bash
+python scripts/test_robodojo_piper_replay.py --episode-index 4 --execute
+```
+
+### 方式二：实拍、实测、请求一次 API
+
+```bash
+python scripts/robodojo_piper_api_probe.py --config "$PIPER_CONFIG"
+```
+
+脚本读取三路相机和从臂反馈，向真实 API 发起一次推理并打印 HTTP 状态、耗时及动作整段校验结果。每行按左臂六关节（rad）、左夹爪（m）、右臂六关节（rad）、右夹爪（m）排列。脚本只打开反馈连接，始终零电机目标下发；在时间窗内取不到有效观测则退出。
+
+### 方式三：实机单步部署示例
+
+先完成方式一，核对整段预测和现场环境。下列命令用临时配置把本次 SDK 速度设为 10%，并把模型目标限制为一条，会话限时 45 秒。若下次使能仍受电子停止阻止，检查现场后按注释中的命令恢复。
+
+```bash
+python scripts/recover.py --config "$PIPER_CONFIG" --execute
+
+python scripts/run.py --config "$MOTION_CONFIG" --execute --steps 1 --seconds 45
+
+```
+
+启动时使能从臂并提交当前姿态目标。等待 `Commands + Enter`，确认两臂活动范围后输入 `p` 回车。整段校验通过后，控制器提交首条模型目标，进入 `HOLD` 并退出。退出时 SDK 执行电子停止清理。末尾 JSON 的 `steps: 1` 表示已提交一条模型目标，实物和反馈用于确认实际运动。
+
+输入 `hold` 回车可主动暂停并使旧响应失效，`q` 退出，`stop` 触发电子停止。出现 `policy_error` 和 `HOLD` 时，检查状态、耗时及可用的请求 ID。
+
+
+### 方式四：实机完整部署（连续执行策略）
+
+**终端分工。** 第一阶段采集的终端 A 运行 ROS master，终端 B 运行主从控制与 ROS 话题发布，终端 C 录包。第二阶段的方式一、方式二和方式三共用一个部署终端（可沿用终端 B）。方式一直接通过 SDK 读取相机和从臂反馈。方式二、方式三通过 SDK 控制从臂，部署配置继承的 `record.backend: none` 关闭了 ROS 发布和录制。因此当前三种方式均无需启动终端 A，也无需设置 `ROS_MASTER_URI` 或加载 ROS 环境。
+
+**1. 从本机进入部署终端，检查配置与 CAN 映射。** 先退出占用 CAN 或相机的采集、录包及旧部署进程。
+
+```bash
+cd /home/robot/luojk/AgileX_ws_ljk
+conda activate piper-control
+PIPER_CONFIG="$PWD/configs/robodojo_piper_api.yaml"
+
+python scripts/recover.py --config configs/robodojo_piper_api.yaml --execute
+sudo -v && python scripts/prepare_can.py --config "$PIPER_CONFIG" --execute
+```
+
+**2. 在同一终端先验证实拍推理。** 等探针退出并打印“整段通过本地轨迹校验。未下发目标。”首次联调时，按上面的方式二完成单步验证，确认左右臂反馈和实际动作符合预期后再连续部署。
+
+```bash
+python scripts/robodojo_piper_api_probe.py --config "$PIPER_CONFIG"
+```
+
+若刚完成方式二或先前触发电子停止，且使能仍被拦截，确认现场后在控制进程已退出时执行恢复命令：
+
+```bash
+python scripts/recover.py --config "$PIPER_CONFIG" --execute
+```
+
+**3. 在同一终端启动完整部署。** 先确认两臂活动范围。以下命令沿用单步示例的 10% SDK 速度，通过临时配置覆盖基础配置的 100%。启动会使能从臂并保持当前姿态。看到 `Commands + Enter` 后输入 `p` 回车开始。每段模型动作通过校验后依次执行，队列用完后再请求下一段。单回合默认 120 秒，超时截断并进入 `HOLD`。
+
+```bash
+python scripts/run.py --config "$PIPER_CONFIG" --execute
+```
+
+瓶子立稳后输入 `s` 回车标记成功并进入 `HOLD`。任务失败输入 `f`，需要暂停输入 `hold`，需要电子停止输入 `stop`。退出时输入 `q` 并等待命令返回。若出现 `policy_error` 并进入 `HOLD`，先检查终端的错误原因、HTTP 状态或请求 ID，确认现场后再输入 `p` 重试。
